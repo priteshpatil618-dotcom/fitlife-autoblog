@@ -29,6 +29,7 @@ def gemini(prompt, search=False, retries=4):
             chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
             return text.strip(), chunks
         if r.status_code in (429, 500, 503):
+            print("Gemini retry", r.status_code, r.text[:400], flush=True)
             time.sleep(20 * (i + 1))
             continue
         sys.exit(f"Gemini error {r.status_code}: {r.text[:500]}")
