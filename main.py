@@ -4,36 +4,52 @@ import requests
 import feedparser
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3-flash-preview"
+DEFAULT_MODELS = ("gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3-flash-preview,"
+                  "gemini-2.5-flash-lite,gemini-2.5-flash")
+MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODEL") or DEFAULT_MODELS).split(",") if m.strip()]
+WORKING = []
+NO_SEARCH_USED = False
 BLOG_ID = os.environ["BLOG_ID"]
 CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
-MODE = os.environ.get("PUBLISH_MODE") or "draft"
+MODE = os.environ.get("PUBLISH_MODE") or "draft"      # draft ya live
 USE_IMAGE = (os.environ.get("USE_IMAGE") or "1") == "1"
 HISTORY = "posted.json"
 
 
-def gemini(prompt, search=False, retries=4):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    if search:
-        body["tools"] = [{"google_search": {}}]
+def gemini(prompt, search=False):
+    global NO_SEARCH_USED
     headers = {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
-    for i in range(retries):
-        r = requests.post(url, headers=headers, json=body, timeout=300)
-        if r.status_code == 200:
-            cand = r.json()["candidates"][0]
-            parts = cand.get("content", {}).get("parts", [])
-            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-            chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
-            return text.strip(), chunks
-        if r.status_code in (429, 500, 503):
-            print("Gemini retry", r.status_code, r.text[:1500], flush=True)
-            time.sleep(20 * (i + 1))
-            continue
-        sys.exit(f"Gemini error {r.status_code}: {r.text[:500]}")
-    sys.exit("Gemini: bar-bar fail hua, baad me try karein")
+    order = WORKING + [m for m in MODELS if m not in WORKING]
+    for use_search in ([True, False] if search else [False]):
+        for model in order:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            body = {"contents": [{"parts": [{"text": prompt}]}]}
+            if use_search:
+                body["tools"] = [{"google_search": {}}]
+            for attempt in range(2):
+                r = requests.post(url, headers=headers, json=body, timeout=300)
+                if r.status_code == 200:
+                    cand = r.json()["candidates"][0]
+                    parts = cand.get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                    chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
+                    if text.strip():
+                        if model not in WORKING:
+                            WORKING.insert(0, model)
+                        if search and not use_search:
+                            NO_SEARCH_USED = True
+                            print("WARNING: search grounding nahi chala, bina search ke likha gaya", flush=True)
+                        print(f"OK model={model} search={use_search}", flush=True)
+                        return text.strip(), chunks
+                print(f"FAIL model={model} search={use_search} status={r.status_code} {r.text[:300]}", flush=True)
+                if r.status_code in (500, 503) and attempt == 0:
+                    time.sleep(15)
+                    continue
+                break
+            time.sleep(3)
+    sys.exit("Gemini: koi bhi model nahi chala. Upar ke FAIL lines dekhein.")
 
 
 def trending():
@@ -161,6 +177,9 @@ def main():
                  'style="max-width:100%;height:auto"/></div>')
     if art["desc"]:
         html += f"<p><b>{art['desc']}</b></p>"
+    if NO_SEARCH_USED:
+        html = ("<p><i>[DRAFT NOTE: ye article bina Google Search ke bana hai. "
+                "Publish se pehle facts zaroor check karein aur ye line hata dein.]</i></p>") + html
     html += art["html"] + sources_html(chunks)
 
     link = publish(art["title"], html, art["labels"])
