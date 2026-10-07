@@ -25,7 +25,7 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GEMINI_MODEL: gemini-3.1-flash-lite
+          GEMINI_MODEL: gemini-2.5-flash,gemini-2.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3-flash-preview
           PUBLISH_MODE: draft
           USE_IMAGE: "1"
       - name: Save topic history
