@@ -1,0 +1,37 @@
+name: Daily Blog Post
+
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Generate and post
+        run: python main.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BLOG_ID: ${{ secrets.BLOG_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GEMINI_MODEL: gemini-3-flash-preview
+          PUBLISH_MODE: draft
+          USE_IMAGE: "1"
+      - name: Save topic history
+        run: |
+          git config user.name "autoblog-bot"
+          git config user.email "autoblog-bot@users.noreply.github.com"
+          git add posted.json
+          git commit -m "update topic history" || echo "no changes"
+          git push
