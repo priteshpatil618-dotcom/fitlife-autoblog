@@ -13,9 +13,13 @@ USE_IMAGE = (os.environ.get("USE_IMAGE") or "1") == "1"
 ALLOW_NO_SEARCH_LIVE = (os.environ.get("ALLOW_NO_SEARCH_LIVE") or "0") == "1"
 HISTORY = "posted.json"
 MIN_WORDS = 1000
+MIN_SCORE = 6
+TARGET_POSTS = int(os.environ.get("TARGET_POSTS") or 2)      # roz kitni post public karni hain
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS") or 6)      # is se zyada koshish nahi
+MAX_DRAFTS = int(os.environ.get("MAX_DRAFTS") or 2)          # ek run me zyada se zyada itne reject draft
+PAUSE = int(os.environ.get("PAUSE_SECONDS") or 60)
 
-DEFAULT_MODELS = ("gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3-flash-preview,"
-                  "gemini-2.5-flash-lite,gemini-2.5-flash")
+DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3-flash-preview"
 MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODEL") or DEFAULT_MODELS).split(",") if m.strip()]
 WORKING = []
 NO_SEARCH_USED = False
@@ -131,9 +135,8 @@ def youtube_videos(done):
     return out[:15]
 
 
-def pick_topic(done):
+def pick_topic(done, vids):
     avoid = "\n".join(x for x in done[-60:] if not x.startswith("yt:")) or "(none)"
-    vids = youtube_videos(done)
     if vids:
         lst = "\n".join(f"{i+1}. {v['title']} ({v['views']} views, {v['secs']//60} min)"
                         for i, v in enumerate(vids))
@@ -171,7 +174,9 @@ CLAIM1: <one specific health claim or tip the video makes>
 CLAIM2: <next claim>
 (continue up to CLAIM6; only real claims the video makes, at least 3 if it has them)
 RISK: SAFE or RISKY
-RISKY only if the video promotes treating/curing a named disease, medicines or injections, supplement doses, pregnancy or breastfeeding, children, eating disorders, or extreme fasting (water-only or more than 24 hours). SAFE for everything else: general diet, detox/juice myths, herbal drinks, normal intermittent fasting, exercise, sleep, water, weight, common food myths."""
+RISK_REASON: <one short English sentence>
+RISKY only if the video tells viewers that something CURES or TREATS a named disease, tells them to stop or replace medicines, gives medicine/supplement doses, or is about pregnancy, breastfeeding, children, eating disorders or extreme fasting (water-only or more than 24 hours).
+Casual mentions of general benefits (digestion, weight, sugar levels, immunity, inflammation) are SAFE, because our article will fact-check and debunk exaggerated claims."""
 
 
 # ---------------- Article ----------------
@@ -214,8 +219,10 @@ CLAIMS_UNSEEN = """<h2>वायरल दावा क्या है</h2> (wh
 CHECK_PROMPT = """You are a strict medical-content safety reviewer. Read this Hindi health article HTML.
 FAIL if it has any of: claims of curing/treating/reversing a disease, medicine or supplement doses, invented statistics/study names/quotes, guaranteed or absolute results, telling readers to stop medicines or skip a doctor, "detox" or "boost immunity" promises, or presenting an unproven remedy as working.
 Otherwise PASS.
-Reply EXACTLY in 2 lines:
+Also give a quality SCORE from 1 to 10: how useful, specific and original the article is for Indian readers (concrete examples, clear verdict per point, no filler or repetition, simple natural Hindi). 10 = excellent, 5 = generic and thin.
+Reply EXACTLY in 3 lines:
 VERDICT: PASS or FAIL
+SCORE: <number 1-10>
 REASON: <one short English sentence>
 
 ARTICLE:
@@ -349,10 +356,11 @@ def publish(title, html, labels, mode, slug=""):
     return data.get("url") or data.get("id")
 
 
-def main():
-    done = json.load(open(HISTORY, encoding="utf-8")) if os.path.exists(HISTORY) else []
-    pick = pick_topic(done)
+def make_post(done, vids, save_draft=True):
+    pick = pick_topic(done, vids)
     topic, risk, video = pick["topic"], pick["risk"], pick["video"]
+    if video and video in vids:
+        vids.remove(video)
     print("Topic:", topic, "| risk:", risk, "| video:", video["id"] if video else None, flush=True)
 
     # video seedha dekhna
@@ -363,6 +371,7 @@ def main():
         summary = field(wt, "SUMMARY")
         if len(claims) >= 2:
             seen = True
+            print("Video risk:", field(wt, "RISK"), "|", field(wt, "RISK_REASON"), flush=True)
             if "RISKY" in field(wt, "RISK").upper():
                 risk = "RISKY"
         else:
@@ -390,7 +399,11 @@ def main():
     check_text, _ = gemini(CHECK_PROMPT + art["html"][:40000])
     verdict = field(check_text, "VERDICT").upper()
     reason = field(check_text, "REASON")
-    print("Safety check:", verdict, reason, flush=True)
+    try:
+        score = int(re.search(r"\d+", field(check_text, "SCORE")).group())
+    except Exception:
+        score = 0
+    print("Safety check:", verdict, "| score:", score, "|", reason, flush=True)
 
     words = len(re.sub(r"<[^>]+>", " ", art["html"]).split())
     reasons = []
@@ -400,8 +413,18 @@ def main():
         reasons.append("safety check fail: " + reason)
     if NO_SEARCH_USED and not ALLOW_NO_SEARCH_LIVE:
         reasons.append("Google Search nahi chala")
+    if score < MIN_SCORE:
+        reasons.append(f"quality score {score}/10")
     if words < MIN_WORDS:
         reasons.append(f"article chhota ({words} shabd)")
+
+    if reasons and not save_draft:
+        print("Reject (draft bhi nahi bana):", reasons, flush=True)
+        done.append(topic)
+        if video:
+            done.append("yt:" + video["id"])
+        json.dump(done, open(HISTORY, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        return "rejected"
 
     mode = MODE
     labels = list(art["labels"])
@@ -427,6 +450,33 @@ def main():
     if video:
         done.append("yt:" + video["id"])
     json.dump(done, open(HISTORY, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    return mode
+
+
+def main():
+    done = json.load(open(HISTORY, encoding="utf-8")) if os.path.exists(HISTORY) else []
+    vids = youtube_videos(done)
+    print(f"YouTube candidates: {len(vids)} | target: {TARGET_POSTS} | mode: {MODE}", flush=True)
+    good = drafts = 0
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if good >= TARGET_POSTS:
+            break
+        print(f"\n===== Attempt {attempt}/{MAX_ATTEMPTS} | done {good}/{TARGET_POSTS} =====", flush=True)
+        try:
+            mode = make_post(done, vids, save_draft=(drafts < MAX_DRAFTS))
+        except (Exception, SystemExit) as e:
+            print("Attempt fail:", repr(e)[:300], flush=True)
+            mode = "error"
+        if mode == MODE:
+            good += 1
+        elif mode == "draft":
+            drafts += 1
+        print(f"Attempt result: {mode}", flush=True)
+        if good < TARGET_POSTS and attempt < MAX_ATTEMPTS:
+            time.sleep(PAUSE)
+    print(f"\nSUMMARY: {good}/{TARGET_POSTS} {MODE} posts, {drafts} drafts", flush=True)
+    if good == 0:
+        sys.exit("Aaj ek bhi post nahi bani. Upar ke Attempt logs dekhein.")
 
 
 if __name__ == "__main__":
