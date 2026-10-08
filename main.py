@@ -1,4 +1,5 @@
-import os, re, sys, json, time, datetime, random, html as htmllib
+import os, re, sys, json, time, datetime, random, base64, html as htmllib
+import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import requests
 
@@ -12,12 +13,12 @@ MODE = os.environ.get("PUBLISH_MODE") or "draft"  # draft ya live
 USE_IMAGE = (os.environ.get("USE_IMAGE") or "1") == "1"
 ALLOW_NO_SEARCH_LIVE = (os.environ.get("ALLOW_NO_SEARCH_LIVE") or "0") == "1"
 HISTORY = "posted.json"
-MIN_WORDS = 1000
+MIN_WORDS = 900
 MIN_SCORE = 6
 TARGET_POSTS = int(os.environ.get("TARGET_POSTS") or 2)      # roz kitni post public karni hain
-MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS") or 6)      # is se zyada koshish nahi
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS") or 8)      # is se zyada koshish nahi
 MAX_DRAFTS = int(os.environ.get("MAX_DRAFTS") or 2)          # ek run me zyada se zyada itne reject draft
-PAUSE = int(os.environ.get("PAUSE_SECONDS") or 60)
+PAUSE = int(os.environ.get("PAUSE_SECONDS") or 20)
 
 DEFAULT_MODELS = "gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3-flash-preview"
 MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODEL") or DEFAULT_MODELS).split(",") if m.strip()]
@@ -31,7 +32,7 @@ ALLOWED_LABELS = ["फिटनेस", "डाइट", "योग", "इम्�
 
 
 # ---------------- Gemini ----------------
-def gemini(prompt, search=False, video_url=None, fatal=True):
+def gemini(prompt, search=False, fatal=True, image=None):
     global NO_SEARCH_USED, SEARCH_OK
     headers = {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
     order = WORKING + [m for m in MODELS if m not in WORKING]
@@ -40,10 +41,9 @@ def gemini(prompt, search=False, video_url=None, fatal=True):
         for model in order:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             parts_in = [{"text": prompt}]
+            if image:
+                parts_in.insert(0, {"inline_data": {"mime_type": image[0], "data": image[1]}})
             body = {"contents": [{"parts": parts_in}]}
-            if video_url:
-                parts_in.insert(0, {"file_data": {"file_uri": video_url}})
-                body["generationConfig"] = {"mediaResolution": "MEDIA_RESOLUTION_LOW"}
             if use_search:
                 body["tools"] = [{"google_search": {}}]
             for attempt in range(2):
@@ -60,7 +60,7 @@ def gemini(prompt, search=False, video_url=None, fatal=True):
                             NO_SEARCH_USED = True
                             SEARCH_OK = False
                             print("WARNING: search grounding nahi chala", flush=True)
-                        print(f"OK model={model} search={use_search} video={bool(video_url)}", flush=True)
+                        print(f"OK model={model} search={use_search}", flush=True)
                         return text.strip(), chunks
                 print(f"FAIL model={model} search={use_search} status={r.status_code} {r.text[:300]}", flush=True)
                 if r.status_code in (500, 503) and attempt == 0:
@@ -78,8 +78,35 @@ def field(head, key):
     return m.group(1).strip() if m else ""
 
 
-# ---------------- YouTube ----------------
-YT_QUERIES = ["health tips hindi", "fitness hindi", "gharelu nuskhe", "weight loss hindi", "yoga hindi"]
+# ---------------- Topic discovery ----------------
+def rss_titles(url, params=None):
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        root = ET.fromstring(r.content)
+        out = []
+        for it in root.iter("item"):
+            t = (it.findtext("title") or "").strip()
+            if " - " in t:
+                t = t.rsplit(" - ", 1)[0].strip()
+            if t:
+                out.append(t)
+        return out
+    except Exception as e:
+        print("RSS fail", url[:50], repr(e)[:120], flush=True)
+        return []
+
+
+def news_lines():
+    out = []
+    for q in ["स्वास्थ्य लाइफस्टाइल when:2d", "health tips India when:2d", "घरेलू नुस्खे स्किन हेयर when:2d"]:
+        for t in rss_titles("https://news.google.com/rss/search",
+                            {"q": q, "hl": "hi", "gl": "IN", "ceid": "IN:hi"})[:12]:
+            if t not in out:
+                out.append(t)
+    for t in rss_titles("https://trends.google.com/trending/rss?geo=IN")[:20]:
+        if t not in out:
+            out.append(t)
+    return out
 
 
 def iso_secs(d):
@@ -90,9 +117,11 @@ def iso_secs(d):
     return h * 3600 + mi * 60 + se
 
 
-def youtube_videos(done):
+YT_QUERIES = ["health tips hindi", "gharelu nuskhe", "skin care hindi", "weight loss hindi"]
+
+
+def youtube_lines():
     if not YT_KEY:
-        print("YOUTUBE_API_KEY nahi hai, YouTube step skip.", flush=True)
         return []
     after = (datetime.datetime.now(datetime.timezone.utc) -
              datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -101,11 +130,10 @@ def youtube_videos(done):
         try:
             r = requests.get("https://www.googleapis.com/youtube/v3/search", params={
                 "part": "snippet", "q": q, "type": "video", "order": "viewCount",
-                "videoDuration": "medium",  # 4 se 20 minute
-                "publishedAfter": after, "relevanceLanguage": "hi", "regionCode": "IN",
-                "maxResults": 10, "key": YT_KEY}, timeout=30)
+                "videoDuration": "medium", "publishedAfter": after, "relevanceLanguage": "hi",
+                "regionCode": "IN", "maxResults": 10, "key": YT_KEY}, timeout=30)
             if r.status_code != 200:
-                print("YouTube search error", r.status_code, r.text[:300], flush=True)
+                print("YouTube search error", r.status_code, r.text[:200], flush=True)
                 continue
             for it in r.json().get("items", []):
                 vid = it["id"].get("videoId")
@@ -118,108 +146,106 @@ def youtube_videos(done):
     out = []
     try:
         r = requests.get("https://www.googleapis.com/youtube/v3/videos", params={
-            "part": "snippet,statistics,contentDetails", "id": ",".join(ids[:50]), "key": YT_KEY},
-            timeout=30)
+            "part": "snippet,statistics,contentDetails", "id": ",".join(ids[:50]), "key": YT_KEY}, timeout=30)
+        vs = []
         for it in r.json().get("items", []):
-            if "yt:" + it["id"] in done:
-                continue
-            secs = iso_secs(it.get("contentDetails", {}).get("duration", ""))
-            if not (240 <= secs <= 1200):  # sirf 4 se 20 minute
-                continue
-            out.append({"id": it["id"], "title": it["snippet"]["title"], "secs": secs,
-                        "channel": it["snippet"].get("channelTitle", ""),
-                        "views": int(it.get("statistics", {}).get("viewCount", 0))})
+            if 240 <= iso_secs(it.get("contentDetails", {}).get("duration", "")) <= 1200:
+                vs.append((int(it.get("statistics", {}).get("viewCount", 0)), it["snippet"]["title"]))
+        vs.sort(reverse=True)
+        out = [f"{t} (YouTube, {v} views)" for v, t in vs[:12]]
     except Exception as e:
         print("YouTube videos exception", e, flush=True)
-    out.sort(key=lambda v: v["views"], reverse=True)
-    return out[:15]
+    return out
 
 
-def pick_topic(done, vids):
-    avoid = "\n".join(x for x in done[-60:] if not x.startswith("yt:")) or "(none)"
-    if vids:
-        lst = "\n".join(f"{i+1}. {v['title']} ({v['views']} views, {v['secs']//60} min)"
-                        for i, v in enumerate(vids))
-        text, _ = gemini(
-            "These are the most viewed Hindi health/fitness YouTube videos this week:\n" + lst +
-            "\n\nPick ONE video whose topic is a popular health/fitness claim, myth or tip that can be "
-            "written about as a fact-check article. Skip topics already covered:\n" + avoid +
-            "\n\nRISK rules: RISKY only if it is about treating/curing a named disease (diabetes, BP, thyroid, "
-            "cancer, kidney, liver, uric acid, cholesterol, heart, PCOS, etc.), medicines or injections, "
-            "supplement doses, pregnancy or breastfeeding, children, eating disorders, or extreme fasting "
-            "(water-only or more than 24 hours). SAFE for everything else: general diet, detox/juice myths, "
-            "herbal drinks, normal intermittent fasting, exercise, sleep, water, weight, common food myths."
-            "\n\nReply EXACTLY in 3 lines:\nINDEX: <number>\n"
-            "TOPIC: <short English+Hindi topic, e.g. jeera paani for weight loss>\nRISK: SAFE or RISKY")
-        try:
-            idx = int(re.search(r"\d+", field(text, "INDEX")).group()) - 1
-            v = vids[idx]
-            topic = field(text, "TOPIC")
-            if topic:
-                return {"topic": topic, "risk": field(text, "RISK").upper(), "video": v}
-        except Exception as e:
-            print("Topic parse fail", e, text[:200], flush=True)
+PICK_PROMPT = """Below are today's Hindi health/lifestyle news headlines, trending searches in India and popular YouTube video titles:
+{list}
+
+Pick ONE topic that many Indians are searching for and that can be written as a practical, helpful guide in simple Hindi. Good topics: body care, skin and hair care, home care, food and diet, exercise, sleep, common symptoms explained, everyday health tips, awareness about common conditions.
+Skip topics already covered:
+{avoid}
+
+TYPE rules:
+HOWTO = practical how-to / home-care / lifestyle topic (e.g. how to clean ears safely, ingrown hair care, dark inner thighs, a diet routine).
+AWARENESS = explaining a health condition for awareness only (symptoms, causes, risk factors, prevention, when to see a doctor), e.g. kidney disease symptoms.
+AVOID = asks for a cure or treatment of a serious disease, medicines/injections/doses, pregnancy or baby/child treatment, extreme fasting, dangerous procedures, deaths/sensitive celebrity or political news, anything unsafe to self-treat.
+Prefer HOWTO or AWARENESS. Choose AVOID only if nothing else fits.
+
+Reply EXACTLY in 3 lines:
+TOPIC: <topic in English + Hindi, e.g. ear wax safe removal / कान की मैल कैसे निकालें>
+TYPE: HOWTO or AWARENESS or AVOID
+SOURCE: <the headline it came from, short>"""
+
+
+def pick_topic(done, items):
+    avoid = "\n".join(done[-60:]) or "(none)"
+    if items:
+        text, _ = gemini(PICK_PROMPT.replace("{list}", "\n".join(f"- {x}" for x in items[:70]))
+                         .replace("{avoid}", avoid), fatal=False)
+        topic, typ = field(text, "TOPIC"), field(text, "TYPE").upper()
+        if topic:
+            typ = "AVOID" if "AVOID" in typ else ("AWARENESS" if "AWARE" in typ else "HOWTO")
+            return {"topic": topic, "type": typ, "source": field(text, "SOURCE")}
+        print("Topic parse fail:", text[:200], flush=True)
     today = datetime.date.today().strftime("%d %B %Y")
     text, _ = gemini(
-        f"Today is {today}. Suggest ONE popular, safe lifestyle health or fitness topic (diet chart, "
-        "home workout, sleep, water, seasonal food) for Hindi readers in India. Avoid:\n" + avoid +
-        "\n\nReply with only the topic name.", search=True)
-    return {"topic": text.splitlines()[0].strip(), "risk": "SAFE", "video": None}
-
-
-WATCH_PROMPT = """Watch this video carefully. It is a Hindi health/fitness video.
-Reply EXACTLY in this format (paraphrase everything in your own English words, never quote sentences):
-SUMMARY: <1-2 sentences: what the video is about>
-CLAIM1: <one specific health claim or tip the video makes>
-CLAIM2: <next claim>
-(continue up to CLAIM6; only real claims the video makes, at least 3 if it has them)
-RISK: SAFE or RISKY
-RISK_REASON: <one short English sentence>
-RISKY only if the video tells viewers that something CURES or TREATS a named disease, tells them to stop or replace medicines, gives medicine/supplement doses, or is about pregnancy, breastfeeding, children, eating disorders or extreme fasting (water-only or more than 24 hours).
-Casual mentions of general benefits (digestion, weight, sugar levels, immunity, inflammation) are SAFE, because our article will fact-check and debunk exaggerated claims."""
+        f"Today is {today}. Suggest ONE popular everyday health, body-care or lifestyle topic that Indians "
+        "search for (skin, hair, diet, exercise, sleep, seasonal care). Avoid:\n" + avoid +
+        "\n\nReply with only the topic in English + Hindi.", search=True)
+    return {"topic": text.splitlines()[0].strip(), "type": "HOWTO", "source": ""}
 
 
 # ---------------- Article ----------------
-PROMPT = """You are a careful health writer for an Indian blog named "FitLife India".
+PROMPT = """You are a careful health writer for an Indian Hindi blog named "FitLife India".
 Topic: {topic}
-{claim}
-Write a "सच या झूठ" (fact-check) article. Use Google Search (when available) to verify facts from reliable sources (WHO, ICMR, NIH, AIIMS, Mayo Clinic, peer-reviewed studies). Write original content in your own words and your own structure.
+Write a practical, helpful guide article like a good Indian lifestyle/health portal (clear, specific, useful). Use Google Search (when available) to verify facts from reliable sources (WHO, ICMR, NIH, AIIMS, Mayo Clinic). Write original content in your own words and your own structure. Never copy any headline or article.
 
-Language: very simple everyday Hindi in Devanagari, the way people talk. Use common English words people already use (weight loss, diet, workout, protein, tips, doctor). Avoid heavy/shuddh Hindi words. Short sentences. 1500-2000 words, deep and useful, with Indian examples (dal, roti, sabzi, chai, local seasons, daily routines). Do not pad with generic filler.
+Language: very simple everyday Hindi in Devanagari, the way people talk. Use common English words people already use (weight loss, diet, skin care, doctor, tips). Avoid heavy/shuddh Hindi words. Short sentences. 1500-2000 words, deep and useful, with Indian examples (dal, roti, sabzi, chai, nariyal tel, haldi, seasons, daily routine). No filler.
 
 Strict rules:
-- Medical safety: no cure claims, no guaranteed results, no "detox" or "boost immunity" promises, no medicine/supplement doses. Use cautious wording ("मदद कर सकता है", "पक्का सबूत नहीं है"). Never discourage seeing a doctor.
+- Medical safety: no cure claims, no guaranteed results, no "detox" or "boost immunity" promises, no medicine/supplement doses (for store-bought products say "follow the label or ask a pharmacist"). Use cautious wording ("मदद कर सकता है", "हर किसी पर एक जैसा असर नहीं होता"). Never discourage seeing a doctor.
 - Do NOT invent statistics, percentages, study names, quotes or numbers. If unsure, leave it out. Never say a doctor reviewed the article.
 - Structure:
-  1. 2-line hook (relatable question) + direct answer.
-  2. <h2>सच या झूठ? सीधा जवाब</h2> with a <blockquote> giving the overall verdict in 2-3 lines.
-  3. {claims_section}
-  4. <h2>कैसे अपनाएं (सुरक्षित तरीका)</h2> with practical Indian examples, include one HTML <table> with <thead>/<tbody> (क्या खाएं / क्या न खाएं, or a simple routine).
-  5. <h2>किसे सावधानी रखनी चाहिए</h2>
-  6. <h2>कब डॉक्टर से मिलें</h2>
-  7. FAQ: one <h2>, then 4 questions as <h3>, each followed by a <p>.
-  8. One short closing paragraph (share/comment), then ONE short <blockquote> medical disclaimer (only one disclaimer in the whole article).
+{structure}
 - Allowed HTML only: h2, h3, p, ul, li, ol, strong, table, thead, tbody, tr, th, td, blockquote. No <h1>, <html>, <body>, markdown, code fences.
 
 Output EXACTLY in this format (no extra text before it):
-TITLE: <own Hindi title with the main keyword, max 65 characters, must NOT copy any video title, no clickbait promises. {title_rule}>
+TITLE: <Hindi title written like what people search, with the main keyword, max 65 characters. {title_rule} Never use "N दावों का सच" or "सच या झूठ" unless the topic itself is a myth. Must not copy any news headline.>
 DESCRIPTION: <Hindi meta description, max 150 characters>
-SLUG: <4-6 lowercase English words describing the topic, e.g. vegetable juice weight loss facts>
-LABELS: <2 or 3 labels that best match this topic, ONLY from this list, comma-separated. Use "घरेलू उपाय" only if the topic is a home remedy: """ + ", ".join(ALLOWED_LABELS) + """>
+SLUG: <4-6 lowercase English words describing the topic, e.g. ear wax safe removal>
+LABELS: <2 or 3 labels that best match this topic, ONLY from this list, comma-separated: """ + ", ".join(ALLOWED_LABELS) + """>
 IMAGE_QUERY: <2-4 English words for a stock photo search, topic specific>
-IMAGE_PROMPT: <English prompt for a bright realistic photo of food, a drink, objects or an empty scene related to the topic; no people, no faces, no text, no watermark, no logo>
+IMAGE1_PROMPT: <English prompt for a realistic documentary-style photo that DIRECTLY shows the main subject of the article title, so the topic is obvious at first glance. Examples: for ear wax care: a person gently cleaning the outer ear with a soft cloth in a bathroom; for tai chi walking: a person doing slow tai chi steps in a living room; for ingrown hair care: a person applying moisturiser on a shaved leg. People may appear from the side or back, as hands, or small in frame, but NO close-up faces. No text, no logos, no watermark, no gore, no medical diagrams>
+IMAGE2_PROMPT: <English prompt for a DIFFERENT realistic photo for the middle of the article, showing one specific step, food, ingredient or habit from the article. Same rules as IMAGE1_PROMPT>
+IMAGE_ALT: <short Hindi alt text for image 1>
 ===HTML===
 <the article HTML>
 """
 
-CLAIMS_SEEN = """For EACH claim below, write its own section: <h2>दावा N: <the claim in simple Hindi></h2>, then <p><strong>फैसला: सच / आधा सच / पक्का सबूत नहीं / झूठ</strong></p>, then 2-3 short paragraphs: what is reasonable, what is exaggerated or unproven, and an Indian everyday example. Keep the claim numbering exactly as given."""
+HOWTO_STRUCTURE = """  1. 2-line hook (relatable situation) and a short direct answer.
+  2. <h2> why this happens / background (simple explanation).
+  3. <h2> the main practical methods: 4-6 items, each as <h3>तरीका N: ...</h3> then 2-3 short paragraphs (how to do it step by step, why it may help, one caution). Only low-risk, common-sense methods.
+  4. <h2>क्या न करें</h2> with a <ul>.
+  5. <h2> prevention / right habits with Indian examples, including one HTML <table> with <thead>/<tbody> (क्या करें / क्या न करें).
+  6. <h2>कब डॉक्टर के पास जाएं</h2> (clear warning signs).
+  7. FAQ: one <h2>, then 5 questions as <h3>, each followed by a <p>.
+  8. One short closing paragraph (share/comment), then ONE short <blockquote> medical disclaimer (only one disclaimer in the whole article)."""
 
-CLAIMS_UNSEEN = """<h2>वायरल दावा क्या है</h2> (what people commonly claim about this topic), then <h2>असल में क्या सही है</h2> with 3-5 short bullet/paragraph points (what is reasonable, what is unproven or exaggerated)."""
+AWARE_STRUCTURE = """  1. 2-line hook and a short direct answer: what this condition is and why awareness matters.
+  2. <h2>X क्या है</h2> (simple explanation, what the body part does).
+  3. <h2>लक्षण</h2> with a <ul>; mention that early stages may show no symptoms; symptoms alone cannot confirm anything.
+  4. <h2>कारण और रिस्क फैक्टर</h2>
+  5. <h2>जांच कैसे होती है</h2> (only general: the doctor decides which tests are needed).
+  6. <h2>बचाव और लाइफस्टाइल</h2> with Indian diet/daily-routine examples, including one HTML <table> with <thead>/<tbody> (क्या करें / क्या न करें).
+  7. <h2>इलाज के बारे में सही समझ</h2>: only general ideas (treatment depends on cause and stage and is decided by a doctor). No home-remedy or herbal cure claims, no medicine names or doses, no self-treatment advice.
+  8. <h2>कब डॉक्टर से मिलें</h2>
+  9. FAQ: one <h2>, then 5 questions as <h3>, each followed by a <p>.
+  10. One short closing paragraph (share/comment), then ONE short <blockquote> medical disclaimer (only one disclaimer in the whole article)."""
 
 CHECK_PROMPT = """You are a strict medical-content safety reviewer. Read this Hindi health article HTML.
-FAIL if it has any of: claims of curing/treating/reversing a disease, medicine or supplement doses, invented statistics/study names/quotes, guaranteed or absolute results, telling readers to stop medicines or skip a doctor, "detox" or "boost immunity" promises, or presenting an unproven remedy as working.
+FAIL if it has any of: claims of curing/treating/reversing a disease, medicine or supplement doses, invented statistics/study names/quotes, guaranteed or absolute results, telling readers to stop medicines or skip a doctor, "detox" or "boost immunity" promises, home remedies or herbs presented as treatment for a serious disease, or unsafe self-treatment advice.
 Otherwise PASS.
-Also give a quality SCORE from 1 to 10: how useful, specific and original the article is for Indian readers (concrete examples, clear verdict per point, no filler or repetition, simple natural Hindi). 10 = excellent, 5 = generic and thin.
+Also give a quality SCORE from 1 to 10: how useful, specific and original the article is for Indian readers (concrete practical steps, no filler or repetition, simple natural Hindi). 10 = excellent, 5 = generic and thin.
 Reply EXACTLY in 3 lines:
 VERDICT: PASS or FAIL
 SCORE: <number 1-10>
@@ -227,6 +253,15 @@ REASON: <one short English sentence>
 
 ARTICLE:
 """
+
+EXPAND_PROMPT = """Below is a Hindi health guide article in HTML. Rewrite it so it is deeper and longer, at least 1300 words, by adding concrete detail inside each existing section: more everyday Indian examples, practical do/don't points and clearer explanation. Keep the same structure, headings, the table, the FAQ and exactly ONE disclaimer at the end. Do NOT add statistics, study names, quotes, medicine/supplement doses or cure claims. Keep simple everyday Hindi. Output only the HTML, no markdown, no code fences.
+
+ARTICLE:
+"""
+
+
+def word_count(h):
+    return len(re.sub(r"<[^>]+>", " ", h).split())
 
 
 def parse(text):
@@ -236,7 +271,8 @@ def parse(text):
     labels = [x for x in labels if x in ALLOWED_LABELS][:3] or ["फिटनेस"]
     slug = re.sub(r"\s+", " ", re.sub(r"[^a-zA-Z0-9 ]", " ", field(head, "SLUG"))).strip().lower()[:60]
     return {"title": field(head, "TITLE"), "desc": field(head, "DESCRIPTION"), "labels": labels,
-            "slug": slug, "image": field(head, "IMAGE_PROMPT"),
+            "slug": slug, "image1": field(head, "IMAGE1_PROMPT") or field(head, "IMAGE_PROMPT"),
+            "image2": field(head, "IMAGE2_PROMPT"), "alt": field(head, "IMAGE_ALT"),
             "image_query": field(head, "IMAGE_QUERY"), "html": body}
 
 
@@ -279,39 +315,91 @@ def pexels_image(query):
         return None
 
 
-def image_html(art):
-    alt = htmllib.escape(art["title"], quote=True)
-    px = pexels_image(art["image_query"])
-    crop = False
-    if px:
-        src, name, link = px
-        cap = f'<br/><small>Photo: <a href="{link}" rel="nofollow noopener" target="_blank">{htmllib.escape(name)}</a> / Pexels</small>'
-    elif USE_IMAGE and art["image"]:
-        prompt = art["image"] + ", no text, no watermark, no logo"
-        src = "https://image.pollinations.ai/prompt/" + quote(prompt) + "?width=1200&height=700&nologo=true"
-        cap = ""
-        crop = True  # neeche ki patti kaat dete hain (watermark wahi hota hai)
-    else:
-        return ""
-    if crop:
+IMG_STYLE = ", realistic documentary photo, natural light, sharp focus, no text, no watermark, no logo, no close-up face"
+
+JUDGE_PROMPT = """Judge this photo for a Hindi health article.
+Article title: {title}
+The photo should show: {want}
+Ignore a tiny watermark or logo at the very bottom edge.
+Reply EXACTLY in 3 lines:
+MATCH: <1-10, how clearly and directly the photo shows the intended subject>
+PROBLEMS: <none, or a short list: readable text, logo, deformed hands/face/body, gore or medical close-up, nudity, unrelated scene>
+OK: YES only if MATCH is 7 or more and there are no problems, else NO"""
+
+
+def poll_url(prompt, seed):
+    return ("https://image.pollinations.ai/prompt/" + quote(prompt + IMG_STYLE) +
+            f"?width=1200&height=700&nologo=true&seed={seed}")
+
+
+def fetch_image(url):
+    for _ in range(2):
+        try:
+            r = requests.get(url, timeout=120)
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 200 and ct.startswith("image") and len(r.content) > 8000:
+                return r.content, ct.split(";")[0]
+            print("Image fetch bad:", r.status_code, ct, len(r.content), flush=True)
+        except Exception as e:
+            print("Image fetch exception:", repr(e)[:120], flush=True)
+        time.sleep(5)
+    return None, None
+
+
+def pick_image(prompt, title, tries=3):
+    """Pollinations se image banao, Gemini se dekhkar jaanchte hain ki topic se match karti hai ya nahi."""
+    best_score, best_url = 0, None
+    for i in range(tries):
+        url = poll_url(prompt, random.randint(1, 999999))
+        data, mime = fetch_image(url)
+        if not data:
+            continue
+        txt, _ = gemini(JUDGE_PROMPT.replace("{title}", title).replace("{want}", prompt),
+                        image=(mime, base64.b64encode(data).decode()), fatal=False)
+        if not txt:
+            print("Image judge nahi chala, bina jaanch ke image li.", flush=True)
+            return url
+        try:
+            score = int(re.search(r"\d+", field(txt, "MATCH")).group())
+        except Exception:
+            score = 0
+        problems = field(txt, "PROBLEMS")
+        ok = "YES" in field(txt, "OK").upper() and score >= 7
+        print(f"Image try {i+1}: match={score} ok={ok} | {problems[:80]}", flush=True)
+        if ok:
+            return url
+        if problems.lower().startswith("none") and score > best_score:
+            best_score, best_url = score, url
+    if best_url and best_score >= 6:
+        print(f"Image: perfect nahi mili, best (match={best_score}) li.", flush=True)
+        return best_url
+    print("Image: koi sahi image nahi mili, bina image ke post.", flush=True)
+    return None
+
+
+def img_block(src, alt, crop=True, cap=""):
+    alt = htmllib.escape(alt, quote=True)
+    if crop:  # neeche ki patti kaat dete hain (watermark wahi hota hai)
         img = (f'<div style="overflow:hidden;border-radius:8px"><img src="{src}" alt="{alt}" '
                'style="width:100%;display:block;margin-bottom:-9%"/></div>')
     else:
         img = f'<img src="{src}" alt="{alt}" style="max-width:100%;height:auto;border-radius:8px"/>'
-    return f'<div style="text-align:center;margin-bottom:12px">{img}{cap}</div>'
+    return f'<div style="text-align:center;margin:12px 0">{img}{cap}</div>'
 
 
-def video_embed(v):
-    t = htmllib.escape(v["title"])
-    ch = htmllib.escape(v["channel"])
-    return ('<h2>वायरल वीडियो</h2>'
-            '<p><small>यह वीडियो हमारा नहीं है। इसमें कही गई बातें उसके क्रिएटर की हैं। '
-            'इन दावों की जांच ऊपर लिखी है।</small></p>'
-            '<div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;margin:12px 0">'
-            f'<iframe src="https://www.youtube-nocookie.com/embed/{v["id"]}" title="{t}" '
-            'style="position:absolute;top:0;left:0;width:100%;height:100%;border:0" allowfullscreen></iframe></div>'
-            f'<p><small>वीडियो: <a href="https://www.youtube.com/watch?v={v["id"]}" rel="nofollow noopener" '
-            f'target="_blank">{t}</a> &middot; चैनल: {ch}</small></p>')
+def make_image_html(prompt, alt, title, query=None):
+    if not USE_IMAGE:
+        return ""
+    px = pexels_image(query) if query else None
+    if px:
+        src, name, link = px
+        cap = (f'<br/><small>Photo: <a href="{link}" rel="nofollow noopener" target="_blank">'
+               f'{htmllib.escape(name)}</a> / Pexels</small>')
+        return img_block(src, alt, crop=False, cap=cap)
+    if not prompt:
+        return ""
+    url = pick_image(prompt, title)
+    return img_block(url, alt) if url else ""
 
 
 AUTHOR_BOX = '<blockquote><b>लेखक:</b> FitLife India टीम</blockquote>'
@@ -356,45 +444,41 @@ def publish(title, html, labels, mode, slug=""):
     return data.get("url") or data.get("id")
 
 
-def make_post(done, vids, save_draft=True):
-    pick = pick_topic(done, vids)
-    topic, risk, video = pick["topic"], pick["risk"], pick["video"]
-    if video and video in vids:
-        vids.remove(video)
-    print("Topic:", topic, "| risk:", risk, "| video:", video["id"] if video else None, flush=True)
+def save_history(done):
+    json.dump(done, open(HISTORY, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
-    # video seedha dekhna
-    seen, claims, summary = False, [], ""
-    if video:
-        wt, _ = gemini(WATCH_PROMPT, video_url="https://www.youtube.com/watch?v=" + video["id"], fatal=False)
-        claims = re.findall(r"^CLAIM\d+:\s*(.+)$", wt, re.M)[:6]
-        summary = field(wt, "SUMMARY")
-        if len(claims) >= 2:
-            seen = True
-            print("Video risk:", field(wt, "RISK"), "|", field(wt, "RISK_REASON"), flush=True)
-            if "RISKY" in field(wt, "RISK").upper():
-                risk = "RISKY"
-        else:
-            print("Video dekh nahi paye, bina video ke article banega.", flush=True)
-    print("Video seen:", seen, "| claims:", len(claims), flush=True)
 
-    if seen:
-        claim = (f'This article fact-checks the claims of a popular video titled "{video["title"]}". '
-                 f"Video summary: {summary}\nClaims it makes (paraphrased):\n" +
-                 "\n".join(f"{i+1}. {c}" for i, c in enumerate(claims)) + "\n")
-        claims_section = CLAIMS_SEEN
-        title_rule = (f"The title MUST contain the number {len(claims)} (e.g. '{len(claims)} दावे')."
-                      if 3 <= len(claims) <= 7 else "Do not put a number in the title.")
+def make_post(done, items, save_draft=True):
+    pick = pick_topic(done, items)
+    topic, typ = pick["topic"], pick["type"]
+    print("Topic:", topic, "| type:", typ, "| source:", pick["source"], flush=True)
+
+    if typ == "AVOID":
+        print("Topic risky/sensitive, article nahi likha.", flush=True)
+        done.append(topic)
+        save_history(done)
+        return "rejected"
+
+    if typ == "AWARENESS":
+        structure = AWARE_STRUCTURE
+        title_rule = "Style: '<condition>: लक्षण, कारण और बचाव' or a similar search-friendly title."
     else:
-        claim = ""
-        claims_section = CLAIMS_UNSEEN
-        title_rule = "Put a number in the title only if the article truly has that many numbered points."
-    prompt = (PROMPT.replace("{topic}", topic).replace("{claim}", claim)
-              .replace("{claims_section}", claims_section).replace("{title_rule}", title_rule))
+        structure = HOWTO_STRUCTURE
+        title_rule = "Style: a how-to question like 'कान की मैल कैसे निकालें? सही और सुरक्षित तरीका'."
+    prompt = (PROMPT.replace("{topic}", topic).replace("{structure}", structure)
+              .replace("{title_rule}", title_rule))
     text, chunks = gemini(prompt, search=True)
     art = parse(text)
     if not art["title"] or len(art["html"]) < 2000:
         sys.exit("Article adhura/chhota aaya, post nahi ki gayi.\n" + text[:500])
+
+    if word_count(art["html"]) < 1200:
+        et, _ = gemini(EXPAND_PROMPT + art["html"][:40000], fatal=False)
+        et = re.sub(r"^```(?:html)?\s*|\s*```$", "", et.strip())
+        before, after = word_count(art["html"]), word_count(et)
+        print(f"Expand: {before} -> {after} shabd", flush=True)
+        if after > before * 1.15 and "<h2" in et and "<table" in et:
+            art["html"] = et
 
     check_text, _ = gemini(CHECK_PROMPT + art["html"][:40000])
     verdict = field(check_text, "VERDICT").upper()
@@ -405,10 +489,8 @@ def make_post(done, vids, save_draft=True):
         score = 0
     print("Safety check:", verdict, "| score:", score, "|", reason, flush=True)
 
-    words = len(re.sub(r"<[^>]+>", " ", art["html"]).split())
+    words = word_count(art["html"])
     reasons = []
-    if risk != "SAFE":
-        reasons.append("risky topic")
     if "PASS" not in verdict:
         reasons.append("safety check fail: " + reason)
     if NO_SEARCH_USED and not ALLOW_NO_SEARCH_LIVE:
@@ -421,14 +503,14 @@ def make_post(done, vids, save_draft=True):
     if reasons and not save_draft:
         print("Reject (draft bhi nahi bana):", reasons, flush=True)
         done.append(topic)
-        if video:
-            done.append("yt:" + video["id"])
-        json.dump(done, open(HISTORY, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        save_history(done)
         return "rejected"
 
     mode = MODE
     labels = list(art["labels"])
-    html = image_html(art)
+    alt = art["alt"] or art["title"]
+    html = make_image_html(art["image1"], alt, art["title"], art["image_query"])
+    mid = make_image_html(art["image2"], art["title"], art["title"])
     if art["desc"]:
         html += f"<p><b>{htmllib.escape(art['desc'])}</b></p>"
     if reasons:
@@ -437,33 +519,34 @@ def make_post(done, vids, save_draft=True):
         html = ('<p style="background:#fdecea;border:1px solid #d93025;padding:10px;color:#a50e0e">'
                 '[DRAFT NOTE: ' + htmllib.escape("; ".join(reasons)) + '. Publish se pehle facts check '
                 'karein, aur ye note tatha label "तथ्य-जांच बाकी" hata dein.]</p>') + html
-    html += style_html(art["html"])
-    if seen:
-        html += video_embed(video)
-    html += sources_html(chunks) + AUTHOR_BOX
+    body = style_html(art["html"])
+    if mid:
+        pos = [m.start() for m in re.finditer(r"<h2", body)]
+        at = pos[2] if len(pos) >= 3 else (pos[-1] if pos else len(body))
+        body = body[:at] + mid + body[at:]
+    html += body + sources_html(chunks) + AUTHOR_BOX
 
     print("Words:", words, "| mode:", mode, "| reasons:", reasons, flush=True)
     link = publish(art["title"], html, labels, mode, art["slug"])
     print("Done:", mode, link, flush=True)
 
     done.append(topic)
-    if video:
-        done.append("yt:" + video["id"])
-    json.dump(done, open(HISTORY, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    save_history(done)
     return mode
 
 
 def main():
     done = json.load(open(HISTORY, encoding="utf-8")) if os.path.exists(HISTORY) else []
-    vids = youtube_videos(done)
-    print(f"YouTube candidates: {len(vids)} | target: {TARGET_POSTS} | mode: {MODE}", flush=True)
+    done = [x for x in done if not x.startswith("yt:")]
+    items = news_lines() + youtube_lines()
+    print(f"Topic candidates: {len(items)} | target: {TARGET_POSTS} | mode: {MODE}", flush=True)
     good = drafts = 0
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if good >= TARGET_POSTS:
             break
         print(f"\n===== Attempt {attempt}/{MAX_ATTEMPTS} | done {good}/{TARGET_POSTS} =====", flush=True)
         try:
-            mode = make_post(done, vids, save_draft=(drafts < MAX_DRAFTS))
+            mode = make_post(done, items, save_draft=(drafts < MAX_DRAFTS))
         except (Exception, SystemExit) as e:
             print("Attempt fail:", repr(e)[:300], flush=True)
             mode = "error"
