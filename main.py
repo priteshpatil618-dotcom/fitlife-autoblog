@@ -141,10 +141,12 @@ def pick_topic(done):
             "These are the most viewed Hindi health/fitness YouTube videos this week:\n" + lst +
             "\n\nPick ONE video whose topic is a popular health/fitness claim, myth or tip that can be "
             "written about as a fact-check article. Skip topics already covered:\n" + avoid +
-            "\n\nRISK rules: RISKY if it is about treating/curing a disease (diabetes, BP, thyroid, cancer, "
-            "kidney, liver, uric acid, cholesterol, heart, etc.), medicines, supplement doses, pregnancy, "
-            "children, or extreme fasting. SAFE if it is general diet, exercise, sleep, water, weight, "
-            "common food myths.\n\nReply EXACTLY in 3 lines:\nINDEX: <number>\n"
+            "\n\nRISK rules: RISKY only if it is about treating/curing a named disease (diabetes, BP, thyroid, "
+            "cancer, kidney, liver, uric acid, cholesterol, heart, PCOS, etc.), medicines or injections, "
+            "supplement doses, pregnancy or breastfeeding, children, eating disorders, or extreme fasting "
+            "(water-only or more than 24 hours). SAFE for everything else: general diet, detox/juice myths, "
+            "herbal drinks, normal intermittent fasting, exercise, sleep, water, weight, common food myths."
+            "\n\nReply EXACTLY in 3 lines:\nINDEX: <number>\n"
             "TOPIC: <short English+Hindi topic, e.g. jeera paani for weight loss>\nRISK: SAFE or RISKY")
         try:
             idx = int(re.search(r"\d+", field(text, "INDEX")).group()) - 1
@@ -169,7 +171,7 @@ CLAIM1: <one specific health claim or tip the video makes>
 CLAIM2: <next claim>
 (continue up to CLAIM6; only real claims the video makes, at least 3 if it has them)
 RISK: SAFE or RISKY
-RISKY means the video promotes treating/curing a disease, medicines, supplement doses, pregnancy, children, or extreme fasting. SAFE means general diet, exercise, sleep, water, weight or common food myths."""
+RISKY only if the video promotes treating/curing a named disease, medicines or injections, supplement doses, pregnancy or breastfeeding, children, eating disorders, or extreme fasting (water-only or more than 24 hours). SAFE for everything else: general diet, detox/juice myths, herbal drinks, normal intermittent fasting, exercise, sleep, water, weight, common food myths."""
 
 
 # ---------------- Article ----------------
