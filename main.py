@@ -232,17 +232,23 @@ def pexels_image(query):
 def image_html(art):
     alt = htmllib.escape(art["title"], quote=True)
     px = pexels_image(art["image_query"])
+    crop = False
     if px:
         src, name, link = px
         cap = f'<br/><small>Photo: <a href="{link}" rel="nofollow noopener" target="_blank">{htmllib.escape(name)}</a> / Pexels</small>'
     elif USE_IMAGE and art["image"]:
         prompt = art["image"] + ", no text, no watermark, no logo"
-        src = "https://image.pollinations.ai/prompt/" + quote(prompt) + "?width=1200&height=630&nologo=true"
-        cap = ""
+        src = "https://image.pollinations.ai/prompt/" + quote(prompt) + "?width=1200&height=700&nologo=true"
+        cap = "<br/><small>Image: AI-generated</small>"
+        crop = True  # neeche ki patti kaat dete hain (watermark wahi hota hai)
     else:
         return ""
-    return (f'<div style="text-align:center;margin-bottom:12px"><img src="{src}" alt="{alt}" '
-            f'style="max-width:100%;height:auto;border-radius:8px"/>{cap}</div>')
+    if crop:
+        img = (f'<div style="overflow:hidden;border-radius:8px"><img src="{src}" alt="{alt}" '
+               'style="width:100%;display:block;margin-bottom:-9%"/></div>')
+    else:
+        img = f'<img src="{src}" alt="{alt}" style="max-width:100%;height:auto;border-radius:8px"/>'
+    return f'<div style="text-align:center;margin-bottom:12px">{img}{cap}</div>'
 
 
 def video_embed(v):
