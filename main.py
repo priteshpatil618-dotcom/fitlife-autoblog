@@ -1,4 +1,4 @@
-import os, re, sys, json, time, datetime, random, base64, html as htmllib
+import os, re, sys, json, time, datetime, random, base64, io, subprocess, html as htmllib
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import requests
@@ -25,6 +25,9 @@ MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODEL") or DEFAULT_MODELS).
 WORKING = []
 NO_SEARCH_USED = False
 SEARCH_OK = True
+IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-3.1-flash-lite-image"
+USE_GEMINI_IMAGE = (os.environ.get("USE_GEMINI_IMAGE") or "1") == "1"
+GEMINI_IMG_OK = True
 
 ALLOWED_LABELS = ["फिटनेस", "डाइट", "योग", "इम्यूनिटी", "मौसमी स्वास्थ्य", "वजन प्रबंधन",
                   "घरेलू उपाय", "सामान्य रोग", "महिला स्वास्थ्य", "बच्चों का स्वास्थ्य", "मानसिक स्वास्थ्य",
@@ -217,6 +220,8 @@ LABELS: <2 or 3 labels that best match this topic, ONLY from this list, comma-se
 IMAGE_QUERY: <2-4 English words for a stock photo search, topic specific>
 IMAGE1_PROMPT: <English prompt for a realistic documentary-style photo that DIRECTLY shows the main subject of the article title, so the topic is obvious at first glance. Examples: for ear wax care: a person gently cleaning the outer ear with a soft cloth in a bathroom; for tai chi walking: a person doing slow tai chi steps in a living room; for ingrown hair care: a person applying moisturiser on a shaved leg. People may appear from the side or back, as hands, or small in frame, but NO close-up faces. No text, no logos, no watermark, no gore, no medical diagrams>
 IMAGE2_PROMPT: <English prompt for a DIFFERENT realistic photo for the middle of the article, showing one specific step, food, ingredient or habit from the article. Same rules as IMAGE1_PROMPT>
+IMAGE1_SAFE_PROMPT: <English prompt for a simple still-life photo (objects, ingredients, food or a place only, NO people at all) that clearly relates to the article title; used if the main image fails>
+IMAGE2_QUERY: <2-4 English words for a stock photo search for image 2>
 IMAGE_ALT: <short Hindi alt text for image 1>
 ===HTML===
 <the article HTML>
@@ -273,6 +278,7 @@ def parse(text):
     return {"title": field(head, "TITLE"), "desc": field(head, "DESCRIPTION"), "labels": labels,
             "slug": slug, "image1": field(head, "IMAGE1_PROMPT") or field(head, "IMAGE_PROMPT"),
             "image2": field(head, "IMAGE2_PROMPT"), "alt": field(head, "IMAGE_ALT"),
+            "image1_safe": field(head, "IMAGE1_SAFE_PROMPT"), "image2_query": field(head, "IMAGE2_QUERY"),
             "image_query": field(head, "IMAGE_QUERY"), "html": body}
 
 
@@ -321,8 +327,9 @@ JUDGE_PROMPT = """Judge this photo for a Hindi health article.
 Article title: {title}
 The photo should show: {want}
 Ignore a tiny watermark or logo at the very bottom edge.
+Strict scoring: 10 = someone seeing only this photo would immediately guess the article topic. 7 = clearly and specifically related. 5 or less = generic or only loosely related (an empty room, a plant, a plain desk, a random glass of water, a landscape).
 Reply EXACTLY in 3 lines:
-MATCH: <1-10, how clearly and directly the photo shows the intended subject>
+MATCH: <1-10>
 PROBLEMS: <none, or a short list: readable text, logo, deformed hands/face/body, gore or medical close-up, nudity, unrelated scene>
 OK: YES only if MATCH is 7 or more and there are no problems, else NO"""
 
@@ -346,34 +353,215 @@ def fetch_image(url):
     return None, None
 
 
-def pick_image(prompt, title, tries=3):
-    """Pollinations se image banao, Gemini se dekhkar jaanchte hain ki topic se match karti hai ya nahi."""
+def judge(data, mime, title, want):
+    """(score, ok, problems) ya None agar Gemini jaanch na kar paya."""
+    txt, _ = gemini(JUDGE_PROMPT.replace("{title}", title).replace("{want}", want),
+                    image=(mime, base64.b64encode(data).decode()), fatal=False)
+    if not txt:
+        return None
+    try:
+        score = int(re.search(r"\d+", field(txt, "MATCH")).group())
+    except Exception:
+        score = 0
+    problems = field(txt, "PROBLEMS")
+    return score, ("YES" in field(txt, "OK").upper() and score >= 7), problems
+
+
+def pick_image(prompts, title):
+    """prompts = [(prompt, koshish), ...]. Pollinations se banao, Gemini se match jaanchkar lo."""
     best_score, best_url = 0, None
-    for i in range(tries):
-        url = poll_url(prompt, random.randint(1, 999999))
-        data, mime = fetch_image(url)
-        if not data:
+    for prompt, tries in prompts:
+        if not prompt:
             continue
-        txt, _ = gemini(JUDGE_PROMPT.replace("{title}", title).replace("{want}", prompt),
-                        image=(mime, base64.b64encode(data).decode()), fatal=False)
-        if not txt:
-            print("Image judge nahi chala, bina jaanch ke image li.", flush=True)
-            return url
-        try:
-            score = int(re.search(r"\d+", field(txt, "MATCH")).group())
-        except Exception:
-            score = 0
-        problems = field(txt, "PROBLEMS")
-        ok = "YES" in field(txt, "OK").upper() and score >= 7
-        print(f"Image try {i+1}: match={score} ok={ok} | {problems[:80]}", flush=True)
-        if ok:
-            return url
-        if problems.lower().startswith("none") and score > best_score:
-            best_score, best_url = score, url
+        for i in range(tries):
+            url = poll_url(prompt, random.randint(1, 999999))
+            data, mime = fetch_image(url)
+            if not data:
+                continue
+            res = judge(data, mime, title, prompt)
+            if res is None:
+                print("Image judge nahi chala, bina jaanch ke image li.", flush=True)
+                return url
+            score, ok, problems = res
+            print(f"Image try ({prompt[:40]}...) {i+1}: match={score} ok={ok} | {problems[:80]}", flush=True)
+            if ok:
+                return url
+            if problems.lower().startswith("none") and score > best_score:
+                best_score, best_url = score, url
     if best_url and best_score >= 6:
         print(f"Image: perfect nahi mili, best (match={best_score}) li.", flush=True)
         return best_url
     print("Image: koi sahi image nahi mili, bina image ke post.", flush=True)
+    return None
+
+
+def unsplash_image(query, title):
+    """Asli stock photo (Unsplash). Key ho tabhi chalta hai. Gemini match jaanchta hai."""
+    key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    if not key or not query:
+        return None
+    hdr = {"Authorization": "Client-ID " + key}
+    try:
+        r = requests.get("https://api.unsplash.com/search/photos", headers=hdr, timeout=30,
+                         params={"query": query, "per_page": 8, "orientation": "landscape",
+                                 "content_filter": "high"})
+        results = r.json().get("results", []) if r.status_code == 200 else []
+    except Exception as e:
+        print("Unsplash fail", repr(e)[:100], flush=True)
+        return None
+    for p in results[:6]:
+        try:
+            data, mime = fetch_image(p["urls"].get("small") or p["urls"]["regular"])
+            if not data:
+                continue
+            res = judge(data, mime, title, "a real photo for the search: " + query)
+            if res is not None:
+                print(f"Unsplash photo: match={res[0]} ok={res[1]} | {res[2][:60]}", flush=True)
+                if not res[1]:
+                    continue
+            try:
+                requests.get(p["links"]["download_location"], headers=hdr, timeout=15)
+            except Exception:
+                pass
+            utm = "?utm_source=fitlife_autoblog&utm_medium=referral"
+            cap = (f'<br/><small>Photo by <a href="{p["user"]["links"]["html"]}{utm}" rel="nofollow noopener" '
+                   f'target="_blank">{htmllib.escape(p["user"]["name"])}</a> on '
+                   f'<a href="https://unsplash.com/{utm}" rel="nofollow noopener" target="_blank">Unsplash</a></small>')
+            return p["urls"]["regular"], cap
+        except Exception as e:
+            print("Unsplash item fail", repr(e)[:100], flush=True)
+    return None
+
+
+def gemini_image_bytes(prompt):
+    """Gemini (Nano Banana) se image banao. Fail/quota par None, aur is run me dobara try nahi."""
+    global GEMINI_IMG_OK
+    if not GEMINI_IMG_OK:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGE_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
+    text = prompt + ", realistic documentary photo, natural light, no text, no watermark, no logo"
+    cfgs = [{"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "16:9"}},
+            {"responseModalities": ["IMAGE"]}]
+    for ci, cfg in enumerate(cfgs):
+        for attempt in range(2):
+            try:
+                r = requests.post(url, headers=headers, timeout=180,
+                                  json={"contents": [{"parts": [{"text": text}]}], "generationConfig": cfg})
+            except Exception as e:
+                print("Gemini image exception:", repr(e)[:120], flush=True)
+                return None
+            if r.status_code == 200:
+                cands = r.json().get("candidates") or [{}]
+                for p in (cands[0].get("content") or {}).get("parts", []):
+                    d = p.get("inlineData") or p.get("inline_data")
+                    if d and d.get("data"):
+                        return base64.b64decode(d["data"])
+                print("Gemini image: image nahi aayi (sirf text ya refuse).", flush=True)
+                return None
+            print("Gemini image FAIL", r.status_code, r.text[:200], flush=True)
+            if r.status_code == 429 and attempt == 0:
+                time.sleep(25)
+                continue
+            if r.status_code == 400 and ci == 0:
+                break  # imageConfig ke bina dobara
+            if r.status_code in (403, 404, 429):
+                GEMINI_IMG_OK = False
+                print("Gemini image band (quota/permission/model), baaki run me Pollinations.", flush=True)
+            return None
+    return None
+
+
+def to_jpeg(raw, max_w=1200):
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        if im.width > max_w:
+            im = im.resize((max_w, int(im.height * max_w / im.width)))
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=82, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        print("JPEG banana fail (requirements me pillow hai?):", repr(e)[:120], flush=True)
+        return None
+
+
+def host_image(jpeg):
+    """Image ko repo ke images/ folder me daalkar jsDelivr link deta hai. Repo public hona chahiye."""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    branch = os.environ.get("GITHUB_REF_NAME") or "main"
+    if not repo:
+        print("GITHUB_REPOSITORY nahi mila, hosting nahi ho sakti.", flush=True)
+        return None
+    name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{random.randint(1000, 9999)}.jpg"
+    path = os.path.join("images", name)
+    try:
+        os.makedirs("images", exist_ok=True)
+        open(path, "wb").write(jpeg)
+        for cmd in (["git", "config", "user.name", "autoblog-bot"],
+                    ["git", "config", "user.email", "autoblog-bot@users.noreply.github.com"],
+                    ["git", "add", path],
+                    ["git", "commit", "-m", "add image " + name],
+                    ["git", "push"]):
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+    except Exception as e:
+        print("Image push fail:", repr(e)[:200], flush=True)
+        return None
+    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/images/{name}"
+    cdn_url = f"https://cdn.jsdelivr.net/gh/{repo}@{branch}/images/{name}"
+    for _ in range(6):  # pehle raw se pakka karo (private repo me 404 aayega)
+        try:
+            if requests.get(raw_url, timeout=30).status_code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(5)
+    else:
+        print("Image public link par nahi dikhi. Repo PUBLIC karein (Settings > Danger zone).", flush=True)
+        return None
+    for _ in range(4):
+        try:
+            r = requests.get(cdn_url, timeout=30)
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+                return cdn_url
+        except Exception:
+            pass
+        time.sleep(5)
+    print("jsDelivr link nahi chala, raw link use hoga.", flush=True)
+    return raw_url
+
+
+def gemini_hosted_image(prompts, title):
+    """Gemini se image -> Gemini se match jaanch -> repo me host -> link."""
+    global GEMINI_IMG_OK
+    if not (USE_GEMINI_IMAGE and GEMINI_IMG_OK):
+        return None
+    for prompt, tries in prompts:
+        if not prompt:
+            continue
+        for i in range(tries):
+            raw = gemini_image_bytes(prompt)
+            if not raw:
+                if not GEMINI_IMG_OK:
+                    return None
+                continue
+            jpeg = to_jpeg(raw)
+            if not jpeg:
+                GEMINI_IMG_OK = False
+                return None
+            res = judge(jpeg, "image/jpeg", title, prompt)
+            if res is not None:
+                score, ok, problems = res
+                print(f"Gemini image try ({prompt[:40]}...) {i+1}: match={score} ok={ok} | {problems[:80]}", flush=True)
+                if not ok:
+                    time.sleep(4)
+                    continue
+            url = host_image(jpeg)
+            if not url:
+                GEMINI_IMG_OK = False
+                return None
+            print("Gemini image hosted:", url, flush=True)
+            return url
     return None
 
 
@@ -387,18 +575,22 @@ def img_block(src, alt, crop=True, cap=""):
     return f'<div style="text-align:center;margin:12px 0">{img}{cap}</div>'
 
 
-def make_image_html(prompt, alt, title, query=None):
+def make_image_html(prompt, alt, title, query=None, safe=None):
     if not USE_IMAGE:
         return ""
+    gurl = gemini_hosted_image([(prompt, 2), (safe, 1)], title)
+    if gurl:
+        return img_block(gurl, alt, crop=False)
+    us = unsplash_image(query, title)
+    if us:
+        return img_block(us[0], alt, crop=False, cap=us[1])
     px = pexels_image(query) if query else None
     if px:
         src, name, link = px
         cap = (f'<br/><small>Photo: <a href="{link}" rel="nofollow noopener" target="_blank">'
                f'{htmllib.escape(name)}</a> / Pexels</small>')
         return img_block(src, alt, crop=False, cap=cap)
-    if not prompt:
-        return ""
-    url = pick_image(prompt, title)
+    url = pick_image([(prompt, 2), (safe, 3)], title)
     return img_block(url, alt) if url else ""
 
 
@@ -509,8 +701,8 @@ def make_post(done, items, save_draft=True):
     mode = MODE
     labels = list(art["labels"])
     alt = art["alt"] or art["title"]
-    html = make_image_html(art["image1"], alt, art["title"], art["image_query"])
-    mid = make_image_html(art["image2"], art["title"], art["title"])
+    html = make_image_html(art["image1"], alt, art["title"], art["image_query"], art["image1_safe"])
+    mid = make_image_html(art["image2"], art["title"], art["title"], art["image2_query"])
     if art["desc"]:
         html += f"<p><b>{htmllib.escape(art['desc'])}</b></p>"
     if reasons:
