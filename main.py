@@ -321,12 +321,13 @@ def pexels_image(query):
         return None
 
 
-IMG_STYLE = ", realistic documentary photo, natural light, sharp focus, no text, no watermark, no logo, no close-up face"
+IMG_STYLE = ", photorealistic photograph taken with a DSLR camera, real life, natural light, sharp focus, not an illustration, not a painting, not a cartoon, not 3D render, no text, no watermark, no logo, no close-up face"
 
 JUDGE_PROMPT = """Judge this photo for a Hindi health article.
 Article title: {title}
 The photo should show: {want}
 Ignore a tiny watermark or logo at the very bottom edge.
+It must look like a real photograph. If it looks like an illustration, painting, cartoon or 3D render, MATCH cannot be above 4 and PROBLEMS must say: not a real photo style.
 Strict scoring: 10 = someone seeing only this photo would immediately guess the article topic. 7 = clearly and specifically related. 5 or less = generic or only loosely related (an empty room, a plant, a plain desk, a random glass of water, a landscape).
 Reply EXACTLY in 3 lines:
 MATCH: <1-10>
