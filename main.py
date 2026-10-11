@@ -370,14 +370,18 @@ def judge(data, mime, title, want):
 def pick_image(prompts, title):
     """prompts = [(prompt, koshish), ...]. Pollinations se banao, Gemini se match jaanchkar lo."""
     best_score, best_url = 0, None
+    first_url, any_fetched = None, False
     for prompt, tries in prompts:
         if not prompt:
             continue
         for i in range(tries):
             url = poll_url(prompt, random.randint(1, 999999))
+            if first_url is None:
+                first_url = url
             data, mime = fetch_image(url)
             if not data:
                 continue
+            any_fetched = True
             res = judge(data, mime, title, prompt)
             if res is None:
                 print("Image judge nahi chala, bina jaanch ke image li.", flush=True)
@@ -391,6 +395,9 @@ def pick_image(prompts, title):
     if best_url and best_score >= 6:
         print(f"Image: perfect nahi mili, best (match={best_score}) li.", flush=True)
         return best_url
+    if not any_fetched and first_url:
+        print("Image: server se image fetch nahi hui (Pollinations ne roka?), bina jaanch ke link laga rahe hain.", flush=True)
+        return first_url
     print("Image: koi sahi image nahi mili, bina image ke post.", flush=True)
     return None
 
