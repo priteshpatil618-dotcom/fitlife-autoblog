@@ -220,11 +220,12 @@ TITLE: <Hindi title written like what people search, with the main keyword, max 
 DESCRIPTION: <Hindi meta description, max 150 characters>
 SLUG: <4-6 lowercase English words describing the topic, e.g. ear wax safe removal>
 LABELS: <2 or 3 labels that best match this topic, ONLY from this list, comma-separated: """ + ", ".join(ALLOWED_LABELS) + """>
-IMAGE_QUERY: <2-4 English words for a stock photo search, topic specific>
+IMAGE_QUERY: <2-4 English words for a stock photo search: a concrete, visible scene that directly shows the article title topic. Avoid generic words like food, healthy, lifestyle, wellness>
 IMAGE1_PROMPT: <English prompt for a realistic documentary-style photo that DIRECTLY shows the main subject of the article title, so the topic is obvious at first glance. Examples: for ear wax care: a person gently cleaning the outer ear with a soft cloth in a bathroom; for tai chi walking: a person doing slow tai chi steps in a living room; for ingrown hair care: a person applying moisturiser on a shaved leg. People may appear from the side or back, as hands, or small in frame, but NO close-up faces. No text, no logos, no watermark, no gore, no medical diagrams>
 IMAGE2_PROMPT: <English prompt for a DIFFERENT realistic photo for the middle of the article, showing one specific step, food, ingredient or habit from the article. Same rules as IMAGE1_PROMPT>
 IMAGE1_SAFE_PROMPT: <English prompt for a simple still-life photo (objects, ingredients, food or a place only, NO people at all) that clearly relates to the article title; used if the main image fails>
-IMAGE2_QUERY: <2-4 English words for a stock photo search for image 2>
+IMAGE2_QUERY: <2-4 English words for a stock photo search: a DIFFERENT concrete visible scene from one step or tip of the article, still clearly about the title topic. Avoid generic words like food, healthy, lifestyle, wellness>
+IMAGE2_SECTION: <the exact text of the <h2> or <h3> heading in your article that image 2 illustrates. Image 2 must show that section's own subject (a body movement, habit, tip or named item), never a generic or restaurant-style food shot>
 IMAGE_ALT: <short Hindi alt text for image 1>
 ===HTML===
 <the article HTML>
@@ -282,6 +283,7 @@ def parse(text):
             "slug": slug, "image1": field(head, "IMAGE1_PROMPT") or field(head, "IMAGE_PROMPT"),
             "image2": field(head, "IMAGE2_PROMPT"), "alt": field(head, "IMAGE_ALT"),
             "image1_safe": field(head, "IMAGE1_SAFE_PROMPT"), "image2_query": field(head, "IMAGE2_QUERY"),
+            "image2_section": field(head, "IMAGE2_SECTION"),
             "image_query": field(head, "IMAGE_QUERY"), "html": body}
 
 
@@ -331,6 +333,8 @@ Article title: {title}
 The photo should show: {want}
 Ignore a tiny watermark or logo at the very bottom edge.
 It must look like a real photograph. If it looks like an illustration, painting, cartoon or 3D render, MATCH cannot be above 4 and PROBLEMS must say: not a real photo style.
+A photo that only matches the search words but not the article topic (a random dish, an unrelated person or place) scores 5 or less. Staged fashion or glamour stock photos that do not fit the topic also score 5 or less.
+Also score 5 or less: staged glamour or fashion photos (a posed model in heels or costume), restaurant or menu food shots, and photos whose main subject differs from the topic even if loosely related.
 Strict scoring: 10 = someone seeing only this photo would immediately guess the article topic. 7 = clearly and specifically related. 5 or less = generic or only loosely related (an empty room, a plant, a plain desk, a random glass of water, a landscape).
 Reply EXACTLY in 3 lines:
 MATCH: <1-10>
@@ -425,43 +429,45 @@ def pick_image(prompts, title):
     return None
 
 
-def pixabay_image(query, title):
+def pixabay_image(query, title, topic=None):
     """Asli stock photo (Pixabay, free key). Gemini match jaanchta hai, phir image repo me save hoti hai."""
     key = os.environ.get("PIXABAY_API_KEY")
     if not key or not query:
         return None
-    try:
-        r = requests.get("https://pixabay.com/api/", timeout=30, params={
-            "key": key, "q": query[:100], "image_type": "photo", "orientation": "horizontal",
-            "safesearch": "true", "per_page": 12})
-        hits = r.json().get("hits", []) if r.status_code == 200 else []
-        if r.status_code != 200:
-            print("Pixabay search fail", r.status_code, r.text[:100], flush=True)
-    except Exception as e:
-        print("Pixabay exception:", repr(e)[:100], flush=True)
-        return None
-    if not hits:
-        print(f"Pixabay: '{query}' par koi photo nahi mili.", flush=True)
-        return None
-    for h in hits[:6]:
+    words = query.split()
+    queries = [query] + ([" ".join(words[:2])] if len(words) > 2 else [])
+    want_extra = f"; it must clearly show: {topic}" if topic else ""
+    for q in queries:
         try:
-            small, big = h.get("webformatURL"), h.get("largeImageURL") or h.get("webformatURL")
-            data, mime = fetch_image(small)
-            if not data:
-                continue
-            res = judge(data, mime, title, "a real photo for the search: " + query)
-            if res is not None:
-                print(f"Pixabay photo {h.get('id')}: match={res[0]} ok={res[1]} | {res[2][:60]}", flush=True)
-                if not res[1]:
-                    continue
-            bigdata, _ = fetch_image(big)
-            jpeg = to_jpeg(bigdata or data)
-            url = host_image(jpeg) if jpeg else None
-            if url:
-                return url
-            return None  # hosting nahi ho paya, Pixabay link hotlink nahi karenge
+            r = requests.get("https://pixabay.com/api/", timeout=30, params={
+                "key": key, "q": q[:100], "image_type": "photo", "orientation": "horizontal",
+                "safesearch": "true", "per_page": 12})
+            hits = r.json().get("hits", []) if r.status_code == 200 else []
+            if r.status_code != 200:
+                print("Pixabay search fail", r.status_code, r.text[:100], flush=True)
         except Exception as e:
-            print("Pixabay item fail", repr(e)[:100], flush=True)
+            print("Pixabay exception:", repr(e)[:100], flush=True)
+            return None
+        if not hits:
+            print(f"Pixabay: '{q}' par koi photo nahi mili.", flush=True)
+            continue
+        for h in hits[:6]:
+            try:
+                small, big = h.get("webformatURL"), h.get("largeImageURL") or h.get("webformatURL")
+                data, mime = fetch_image(small)
+                if not data:
+                    continue
+                res = judge(data, mime, title, "a real photo for the search: " + q + want_extra)
+                if res is not None:
+                    print(f"Pixabay '{q}' photo {h.get('id')}: match={res[0]} ok={res[1]} | {res[2][:60]}", flush=True)
+                    if not res[1]:
+                        continue
+                bigdata, _ = fetch_image(big)
+                jpeg = to_jpeg(bigdata or data)
+                url = host_image(jpeg) if jpeg else None
+                return url  # hosting nahi hui to None, Pixabay link hotlink nahi karenge
+            except Exception as e:
+                print("Pixabay item fail", repr(e)[:100], flush=True)
     return None
 
 
@@ -655,14 +661,14 @@ def img_block(src, alt, crop=True, cap=""):
     return f'<div style="text-align:center;margin:12px 0">{img}{cap}</div>'
 
 
-def make_image_html(prompt, alt, title, query=None, safe=None):
+def make_image_html(prompt, alt, title, query=None, safe=None, section=None):
     if not USE_IMAGE:
         return ""
     gurl = gemini_hosted_image([(prompt, 2), (safe, 1)], title)
     if gurl:
         IMG_STATS["gemini"] += 1
         return img_block(gurl, alt, crop=False)
-    pb = pixabay_image(query, title)
+    pb = pixabay_image(query, title, section)
     if pb:
         IMG_STATS["pixabay"] += 1
         return img_block(pb, alt, crop=False)
@@ -692,10 +698,77 @@ def make_image_html(prompt, alt, title, query=None, safe=None):
     return ""
 
 
-AUTHOR_BOX = '<blockquote><b>लेखक:</b> FitLife India टीम</blockquote>'
+AUTHOR_NAME = os.environ.get("AUTHOR_NAME") or "FitLife India टीम"
+AUTHOR_BIO = os.environ.get("AUTHOR_BIO") or ""
+AUTHOR_BOX = ("<blockquote><b>लेखक:</b> " + htmllib.escape(AUTHOR_NAME) +
+              ((" &middot; " + htmllib.escape(AUTHOR_BIO)) if AUTHOR_BIO else "") + "</blockquote>")
 
 
 # ---------------- Blogger ----------------
+BAD_TITLE_WORDS = ["100%", "चमत्कार", "जादुई", "तुरंत ठीक", "रामबाण", "कभी नहीं", "गारंटी", "हमेशा के लिए",
+                   "डॉक्टर भी हैरान", "शॉकिंग", "वायरल"]
+
+TITLE_PROMPT = """Write click-worthy but HONEST Hindi titles for this health article (for Google Discover and Search).
+Topic: {topic}
+Draft title: {title}
+Real headings in the article:
+{headings}
+Article opening: {opening}
+
+Write 6 titles, each 38-56 characters, simple everyday Hindi (common English words are fine), each with a DIFFERENT formula:
+1 a question readers really ask
+2 a number list (only if the headings really contain that many tips/steps/mistakes)
+3 clear benefit + how
+4 mistakes to avoid
+5 myth vs fact
+6 what to do + when to see a doctor
+Rules: put the main keyword in the first half. Every promise must be something this article really delivers. NO exaggeration, fake urgency or miracle words (100%, चमत्कार, जादुई, तुरंत ठीक, रामबाण, कभी नहीं, गारंटी). No ALL CAPS, no emoji, at most one ? or : mark. Do not copy any video or news title.
+Then choose the single best one (curiosity + clarity + specificity + honesty).
+Reply EXACTLY in 1 line:
+BEST: <the chosen title>"""
+
+
+def best_title(topic, title, html):
+    headings = re.findall(r"<h[23][^>]*>(.*?)</h[23]>", html, flags=re.S)
+    heads = "\n".join("- " + re.sub(r"<[^>]+>", "", h).strip() for h in headings[:14])
+    opening = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))[:500]
+    txt, _ = gemini(TITLE_PROMPT.replace("{topic}", topic).replace("{title}", title)
+                    .replace("{headings}", heads).replace("{opening}", opening), fatal=False)
+    new = field(txt, "BEST").strip(" \"'*")
+    ok = 18 <= len(new) <= 62 and not any(w in new for w in BAD_TITLE_WORDS) and not new.isupper()
+    if ok:
+        print(f"Title: {title} -> {new}", flush=True)
+        return new
+    print("Title: naya title theek nahi laga, purana rakha:", title, flush=True)
+    return title
+
+
+def related_links(labels, own_title, limit=3):
+    """Blog ke purane live posts me se milte-julte 3 ke link (internal links, Discover/SEO ke liye achha)."""
+    try:
+        r = requests.get(f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts", timeout=30,
+                         headers={"Authorization": "Bearer " + access_token()},
+                         params={"maxResults": 40, "fetchBodies": "false", "status": "live",
+                                 "fields": "items(title,url,labels)"})
+        items = r.json().get("items", []) if r.status_code == 200 else []
+    except Exception as e:
+        print("Related links fail:", repr(e)[:100], flush=True)
+        return ""
+    scored = []
+    for i, it in enumerate(items):
+        if not it.get("url") or it.get("title") == own_title:
+            continue
+        overlap = len(set(it.get("labels") or []) & set(labels))
+        scored.append((-overlap, i, it))  # zyada overlap, phir naya post pehle
+    scored.sort(key=lambda x: (x[0], x[1]))
+    picks = [it for _, _, it in scored[:limit]]
+    if not picks:
+        return ""
+    lis = "".join(f'<li><a href="{htmllib.escape(it["url"], quote=True)}">{htmllib.escape(it["title"])}</a></li>'
+                  for it in picks)
+    return "<h2>यह भी पढ़ें</h2><ul>" + lis + "</ul>"
+
+
 def access_token():
     r = requests.post("https://oauth2.googleapis.com/token", data={
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
@@ -738,6 +811,23 @@ def save_history(done):
     json.dump(done, open(HISTORY, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 
+def insert_mid_image(body, mid, section):
+    """Doosri image ko usi section ke paas lagao jise wo dikhati hai, warna 3rd h2 se pehle."""
+    sec = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", section or "")).strip()
+    if len(sec) >= 4:
+        for m in re.finditer(r"<h[23][^>]*>(.*?)</h[23]>", body, flags=re.S):
+            text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
+            if len(text) >= 4 and (sec in text or text in sec):
+                nxt = re.search(r"<h[23]", body[m.end():])
+                limit = m.end() + nxt.start() if nxt else len(body)
+                p_end = body.find("</p>", m.end())
+                at = p_end + 4 if (p_end != -1 and p_end < limit) else m.end()
+                return body[:at] + mid + body[at:]
+    pos = [m.start() for m in re.finditer(r"<h2", body)]
+    at = pos[2] if len(pos) >= 3 else (pos[-1] if pos else len(body))
+    return body[:at] + mid + body[at:]
+
+
 def make_post(done, items, save_draft=True):
     pick = pick_topic(done, items)
     topic, typ = pick["topic"], pick["type"]
@@ -770,6 +860,8 @@ def make_post(done, items, save_draft=True):
         if after > before * 1.15 and "<h2" in et and "<table" in et:
             art["html"] = et
 
+    art["title"] = best_title(topic, art["title"], art["html"])
+
     check_text, _ = gemini(CHECK_PROMPT + art["html"][:40000])
     verdict = field(check_text, "VERDICT").upper()
     reason = field(check_text, "REASON")
@@ -800,7 +892,7 @@ def make_post(done, items, save_draft=True):
     labels = list(art["labels"])
     alt = art["alt"] or art["title"]
     html = make_image_html(art["image1"], alt, art["title"], art["image_query"], art["image1_safe"])
-    mid = make_image_html(art["image2"], art["title"], art["title"], art["image2_query"])
+    mid = make_image_html(art["image2"], art["title"], art["title"], art["image2_query"], None, art["image2_section"])
     if art["desc"]:
         html += f"<p><b>{htmllib.escape(art['desc'])}</b></p>"
     if reasons:
@@ -811,10 +903,8 @@ def make_post(done, items, save_draft=True):
                 'karein, aur ye note tatha label "तथ्य-जांच बाकी" hata dein.]</p>') + html
     body = style_html(art["html"])
     if mid:
-        pos = [m.start() for m in re.finditer(r"<h2", body)]
-        at = pos[2] if len(pos) >= 3 else (pos[-1] if pos else len(body))
-        body = body[:at] + mid + body[at:]
-    html += body + sources_html(chunks) + AUTHOR_BOX
+        body = insert_mid_image(body, mid, art["image2_section"])
+    html += body + related_links(labels, art["title"]) + sources_html(chunks) + AUTHOR_BOX
 
     print("Words:", words, "| mode:", mode, "| reasons:", reasons, flush=True)
     link = publish(art["title"], html, labels, mode, art["slug"])
