@@ -26,11 +26,11 @@ WORKING = []
 NO_SEARCH_USED = False
 SEARCH_OK = True
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-3.1-flash-lite-image"
-USE_GEMINI_IMAGE = (os.environ.get("USE_GEMINI_IMAGE") or "1") == "1"
+USE_GEMINI_IMAGE = (os.environ.get("USE_GEMINI_IMAGE") or "0") == "1"  # free API tier me quota 0 aata hai
 GEMINI_IMG_OK = True
 GEMINI_IMG_ERR = ""
 HOST_OK = True
-IMG_STATS = {"gemini": 0, "pollinations_hosted": 0, "pollinations_link": 0, "none": 0}
+IMG_STATS = {"pixabay": 0, "gemini": 0, "pollinations_hosted": 0, "pollinations_link": 0, "none": 0}
 
 ALLOWED_LABELS = ["फिटनेस", "डाइट", "योग", "इम्यूनिटी", "मौसमी स्वास्थ्य", "वजन प्रबंधन",
                   "घरेलू उपाय", "सामान्य रोग", "महिला स्वास्थ्य", "बच्चों का स्वास्थ्य", "मानसिक स्वास्थ्य",
@@ -338,19 +338,29 @@ PROBLEMS: <none, or a short list: readable text, logo, deformed hands/face/body,
 OK: YES only if MATCH is 7 or more and there are no problems, else NO"""
 
 
+POLL_KEY = os.environ.get("POLLINATIONS_API_KEY", "")
+POLL_MODEL = os.environ.get("POLLINATIONS_MODEL") or "flux"
+POLL_OK = True
+LAST_FETCH_STATUS = 0
+
+
 def poll_url(prompt, seed):
-    return ("https://image.pollinations.ai/prompt/" + quote(prompt + IMG_STYLE) +
-            f"?width=1200&height=700&nologo=true&seed={seed}")
+    return ("https://gen.pollinations.ai/image/" + quote(prompt + IMG_STYLE) +
+            f"?model={POLL_MODEL}&width=1200&height=700&nologo=true&seed={seed}")
 
 
-def fetch_image(url):
+def fetch_image(url, headers=None):
+    global LAST_FETCH_STATUS
     for _ in range(2):
         try:
-            r = requests.get(url, timeout=120)
+            r = requests.get(url, headers=headers, timeout=120)
+            LAST_FETCH_STATUS = r.status_code
             ct = r.headers.get("content-type", "")
             if r.status_code == 200 and ct.startswith("image") and len(r.content) > 8000:
                 return r.content, ct.split(";")[0]
-            print("Image fetch bad:", r.status_code, ct, len(r.content), flush=True)
+            print("Image fetch bad:", r.status_code, ct, len(r.content), r.text[:120] if "json" in ct else "", flush=True)
+            if r.status_code in (401, 402, 403):
+                return None, None  # key galat ya pollen khatam, dobara try bekaar
         except Exception as e:
             print("Image fetch exception:", repr(e)[:120], flush=True)
         time.sleep(5)
@@ -373,6 +383,12 @@ def judge(data, mime, title, want):
 
 def pick_image(prompts, title):
     """prompts = [(prompt, koshish), ...]. Pollinations se banao, Gemini se match jaanchkar lo."""
+    global POLL_OK
+    if not POLL_KEY:
+        print("POLLINATIONS_API_KEY nahi hai, AI image skip.", flush=True)
+        return None
+    if not POLL_OK:
+        return None
     best_score, best_url, best_data = 0, None, None
     first_url, any_fetched = None, False
     for prompt, tries in prompts:
@@ -382,8 +398,12 @@ def pick_image(prompts, title):
             url = poll_url(prompt, random.randint(1, 999999))
             if first_url is None:
                 first_url = url
-            data, mime = fetch_image(url)
+            data, mime = fetch_image(url, {"Authorization": "Bearer " + POLL_KEY})
             if not data:
+                if LAST_FETCH_STATUS in (401, 402, 403):
+                    POLL_OK = False
+                    print("Pollinations ne roka (key galat ya pollen khatam). Baaki run me AI image band.", flush=True)
+                    return None
                 continue
             any_fetched = True
             res = judge(data, mime, title, prompt)
@@ -400,8 +420,48 @@ def pick_image(prompts, title):
         print(f"Image: perfect nahi mili, best (match={best_score}) li.", flush=True)
         return best_url, best_data
     if not any_fetched:
-        print("Image: server se image fetch nahi hui (Pollinations ne roka?). Toota link lagane se behtar hai ki image na ho.", flush=True)
+        print("Image: server se image fetch nahi hui.", flush=True)
     print("Image: koi sahi image nahi mili, bina image ke post.", flush=True)
+    return None
+
+
+def pixabay_image(query, title):
+    """Asli stock photo (Pixabay, free key). Gemini match jaanchta hai, phir image repo me save hoti hai."""
+    key = os.environ.get("PIXABAY_API_KEY")
+    if not key or not query:
+        return None
+    try:
+        r = requests.get("https://pixabay.com/api/", timeout=30, params={
+            "key": key, "q": query[:100], "image_type": "photo", "orientation": "horizontal",
+            "safesearch": "true", "per_page": 12})
+        hits = r.json().get("hits", []) if r.status_code == 200 else []
+        if r.status_code != 200:
+            print("Pixabay search fail", r.status_code, r.text[:100], flush=True)
+    except Exception as e:
+        print("Pixabay exception:", repr(e)[:100], flush=True)
+        return None
+    if not hits:
+        print(f"Pixabay: '{query}' par koi photo nahi mili.", flush=True)
+        return None
+    for h in hits[:6]:
+        try:
+            small, big = h.get("webformatURL"), h.get("largeImageURL") or h.get("webformatURL")
+            data, mime = fetch_image(small)
+            if not data:
+                continue
+            res = judge(data, mime, title, "a real photo for the search: " + query)
+            if res is not None:
+                print(f"Pixabay photo {h.get('id')}: match={res[0]} ok={res[1]} | {res[2][:60]}", flush=True)
+                if not res[1]:
+                    continue
+            bigdata, _ = fetch_image(big)
+            jpeg = to_jpeg(bigdata or data)
+            url = host_image(jpeg) if jpeg else None
+            if url:
+                return url
+            return None  # hosting nahi ho paya, Pixabay link hotlink nahi karenge
+        except Exception as e:
+            print("Pixabay item fail", repr(e)[:100], flush=True)
     return None
 
 
@@ -602,6 +662,10 @@ def make_image_html(prompt, alt, title, query=None, safe=None):
     if gurl:
         IMG_STATS["gemini"] += 1
         return img_block(gurl, alt, crop=False)
+    pb = pixabay_image(query, title)
+    if pb:
+        IMG_STATS["pixabay"] += 1
+        return img_block(pb, alt, crop=False)
     us = unsplash_image(query, title)
     if us:
         return img_block(us[0], alt, crop=False, cap=us[1])
@@ -622,8 +686,10 @@ def make_image_html(prompt, alt, title, query=None, safe=None):
     if hosted:
         IMG_STATS["pollinations_hosted"] += 1
         return img_block(hosted, alt, crop=False)
-    IMG_STATS["pollinations_link"] += 1
-    return img_block(url, alt)
+    # Pollinations link me key lagti hai, isliye seedha link nahi laga sakte
+    print("Image repo me save nahi ho payi (repo public hai? pillow hai?), image nahi lagi.", flush=True)
+    IMG_STATS["none"] += 1
+    return ""
 
 
 AUTHOR_BOX = '<blockquote><b>लेखक:</b> FitLife India टीम</blockquote>'
@@ -782,7 +848,8 @@ def main():
         if good < TARGET_POSTS and attempt < MAX_ATTEMPTS:
             time.sleep(PAUSE)
     print(f"\nIMAGES: {IMG_STATS} | Gemini image: {'chala' if GEMINI_IMG_OK else 'BAND'} | "
-          f"last Gemini image error: {GEMINI_IMG_ERR or 'none'} | repo hosting: {'ok' if HOST_OK else 'FAIL'}", flush=True)
+          f"last Gemini image error: {GEMINI_IMG_ERR or 'none'} | repo hosting: {'ok' if HOST_OK else 'FAIL'} | "
+          f"Pollinations: {'key nahi' if not POLL_KEY else ('chala' if POLL_OK else 'BAND (402/401)')}", flush=True)
     print(f"\nSUMMARY: {good}/{TARGET_POSTS} {MODE} posts, {drafts} drafts", flush=True)
     if good == 0:
         sys.exit("Aaj ek bhi post nahi bani. Upar ke Attempt logs dekhein.")
