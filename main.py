@@ -28,6 +28,9 @@ SEARCH_OK = True
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-3.1-flash-lite-image"
 USE_GEMINI_IMAGE = (os.environ.get("USE_GEMINI_IMAGE") or "1") == "1"
 GEMINI_IMG_OK = True
+GEMINI_IMG_ERR = ""
+HOST_OK = True
+IMG_STATS = {"gemini": 0, "pollinations_hosted": 0, "pollinations_link": 0, "none": 0}
 
 ALLOWED_LABELS = ["फिटनेस", "डाइट", "योग", "इम्यूनिटी", "मौसमी स्वास्थ्य", "वजन प्रबंधन",
                   "घरेलू उपाय", "सामान्य रोग", "महिला स्वास्थ्य", "बच्चों का स्वास्थ्य", "मानसिक स्वास्थ्य",
@@ -370,7 +373,7 @@ def judge(data, mime, title, want):
 
 def pick_image(prompts, title):
     """prompts = [(prompt, koshish), ...]. Pollinations se banao, Gemini se match jaanchkar lo."""
-    best_score, best_url = 0, None
+    best_score, best_url, best_data = 0, None, None
     first_url, any_fetched = None, False
     for prompt, tries in prompts:
         if not prompt:
@@ -386,19 +389,18 @@ def pick_image(prompts, title):
             res = judge(data, mime, title, prompt)
             if res is None:
                 print("Image judge nahi chala, bina jaanch ke image li.", flush=True)
-                return url
+                return url, data
             score, ok, problems = res
             print(f"Image try ({prompt[:40]}...) {i+1}: match={score} ok={ok} | {problems[:80]}", flush=True)
             if ok:
-                return url
+                return url, data
             if problems.lower().startswith("none") and score > best_score:
-                best_score, best_url = score, url
+                best_score, best_url, best_data = score, url, data
     if best_url and best_score >= 6:
         print(f"Image: perfect nahi mili, best (match={best_score}) li.", flush=True)
-        return best_url
-    if not any_fetched and first_url:
-        print("Image: server se image fetch nahi hui (Pollinations ne roka?), bina jaanch ke link laga rahe hain.", flush=True)
-        return first_url
+        return best_url, best_data
+    if not any_fetched:
+        print("Image: server se image fetch nahi hui (Pollinations ne roka?). Toota link lagane se behtar hai ki image na ho.", flush=True)
     print("Image: koi sahi image nahi mili, bina image ke post.", flush=True)
     return None
 
@@ -468,6 +470,8 @@ def gemini_image_bytes(prompt):
                 print("Gemini image: image nahi aayi (sirf text ya refuse).", flush=True)
                 return None
             print("Gemini image FAIL", r.status_code, r.text[:200], flush=True)
+            global GEMINI_IMG_ERR
+            GEMINI_IMG_ERR = f"{r.status_code} {r.text[:120]}"
             if r.status_code == 429 and attempt == 0:
                 time.sleep(25)
                 continue
@@ -480,10 +484,12 @@ def gemini_image_bytes(prompt):
     return None
 
 
-def to_jpeg(raw, max_w=1200):
+def to_jpeg(raw, max_w=1200, crop_bottom=0.0):
     try:
         from PIL import Image
         im = Image.open(io.BytesIO(raw)).convert("RGB")
+        if crop_bottom:
+            im = im.crop((0, 0, im.width, int(im.height * (1 - crop_bottom))))
         if im.width > max_w:
             im = im.resize((max_w, int(im.height * max_w / im.width)))
         out = io.BytesIO()
@@ -496,10 +502,14 @@ def to_jpeg(raw, max_w=1200):
 
 def host_image(jpeg):
     """Image ko repo ke images/ folder me daalkar jsDelivr link deta hai. Repo public hona chahiye."""
+    global HOST_OK
     repo = os.environ.get("GITHUB_REPOSITORY")
     branch = os.environ.get("GITHUB_REF_NAME") or "main"
+    if not HOST_OK:
+        return None
     if not repo:
         print("GITHUB_REPOSITORY nahi mila, hosting nahi ho sakti.", flush=True)
+        HOST_OK = False
         return None
     name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{random.randint(1000, 9999)}.jpg"
     path = os.path.join("images", name)
@@ -514,6 +524,7 @@ def host_image(jpeg):
             subprocess.run(cmd, check=True, capture_output=True, timeout=120)
     except Exception as e:
         print("Image push fail:", repr(e)[:200], flush=True)
+        HOST_OK = False
         return None
     raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/images/{name}"
     cdn_url = f"https://cdn.jsdelivr.net/gh/{repo}@{branch}/images/{name}"
@@ -526,6 +537,7 @@ def host_image(jpeg):
         time.sleep(5)
     else:
         print("Image public link par nahi dikhi. Repo PUBLIC karein (Settings > Danger zone).", flush=True)
+        HOST_OK = False
         return None
     for _ in range(4):
         try:
@@ -588,6 +600,7 @@ def make_image_html(prompt, alt, title, query=None, safe=None):
         return ""
     gurl = gemini_hosted_image([(prompt, 2), (safe, 1)], title)
     if gurl:
+        IMG_STATS["gemini"] += 1
         return img_block(gurl, alt, crop=False)
     us = unsplash_image(query, title)
     if us:
@@ -598,8 +611,19 @@ def make_image_html(prompt, alt, title, query=None, safe=None):
         cap = (f'<br/><small>Photo: <a href="{link}" rel="nofollow noopener" target="_blank">'
                f'{htmllib.escape(name)}</a> / Pexels</small>')
         return img_block(src, alt, crop=False, cap=cap)
-    url = pick_image([(prompt, 2), (safe, 3)], title)
-    return img_block(url, alt) if url else ""
+    res = pick_image([(prompt, 2), (safe, 3)], title)
+    if not res:
+        IMG_STATS["none"] += 1
+        return ""
+    url, data = res
+    # Pollinations ki image ko apne repo me rakho (watermark kaatkar), taaki link toote nahi
+    jpeg = to_jpeg(data, crop_bottom=0.09) if data else None
+    hosted = host_image(jpeg) if jpeg else None
+    if hosted:
+        IMG_STATS["pollinations_hosted"] += 1
+        return img_block(hosted, alt, crop=False)
+    IMG_STATS["pollinations_link"] += 1
+    return img_block(url, alt)
 
 
 AUTHOR_BOX = '<blockquote><b>लेखक:</b> FitLife India टीम</blockquote>'
@@ -757,6 +781,8 @@ def main():
         print(f"Attempt result: {mode}", flush=True)
         if good < TARGET_POSTS and attempt < MAX_ATTEMPTS:
             time.sleep(PAUSE)
+    print(f"\nIMAGES: {IMG_STATS} | Gemini image: {'chala' if GEMINI_IMG_OK else 'BAND'} | "
+          f"last Gemini image error: {GEMINI_IMG_ERR or 'none'} | repo hosting: {'ok' if HOST_OK else 'FAIL'}", flush=True)
     print(f"\nSUMMARY: {good}/{TARGET_POSTS} {MODE} posts, {drafts} drafts", flush=True)
     if good == 0:
         sys.exit("Aaj ek bhi post nahi bani. Upar ke Attempt logs dekhein.")
