@@ -29,8 +29,13 @@ IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-3.1-flash-lite-ima
 USE_GEMINI_IMAGE = (os.environ.get("USE_GEMINI_IMAGE") or "0") == "1"  # free API tier me quota 0 aata hai
 GEMINI_IMG_OK = True
 GEMINI_IMG_ERR = ""
+CF_ACCOUNT = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CF_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CF_MODEL = os.environ.get("CLOUDFLARE_IMAGE_MODEL") or "@cf/black-forest-labs/flux-1-schnell"
+CF_OK = bool(CF_ACCOUNT and CF_TOKEN) and (os.environ.get("USE_CF_IMAGE") or "1") == "1"
+CF_ERR = ""
 HOST_OK = True
-IMG_STATS = {"pixabay": 0, "gemini": 0, "pollinations_hosted": 0, "pollinations_link": 0, "none": 0}
+IMG_STATS = {"cloudflare": 0, "pixabay": 0, "gemini": 0, "pollinations_hosted": 0, "pollinations_link": 0, "none": 0}
 
 ALLOWED_LABELS = ["फिटनेस", "डाइट", "योग", "इम्यूनिटी", "मौसमी स्वास्थ्य", "वजन प्रबंधन",
                   "घरेलू उपाय", "सामान्य रोग", "महिला स्वास्थ्य", "बच्चों का स्वास्थ्य", "मानसिक स्वास्थ्य",
@@ -460,7 +465,7 @@ def pixabay_image(query, title, topic=None):
                 res = judge(data, mime, title, "a real photo for the search: " + q + want_extra)
                 if res is not None:
                     print(f"Pixabay '{q}' photo {h.get('id')}: match={res[0]} ok={res[1]} | {res[2][:60]}", flush=True)
-                    if not res[1]:
+                    if not res[1] or res[0] < 8:
                         continue
                 bigdata, _ = fetch_image(big)
                 jpeg = to_jpeg(bigdata or data)
@@ -550,12 +555,19 @@ def gemini_image_bytes(prompt):
     return None
 
 
-def to_jpeg(raw, max_w=1200, crop_bottom=0.0):
+def to_jpeg(raw, max_w=1200, crop_bottom=0.0, ratio16x9=False, min_w=0):
     try:
         from PIL import Image
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         if crop_bottom:
             im = im.crop((0, 0, im.width, int(im.height * (1 - crop_bottom))))
+        if ratio16x9:
+            nh = int(im.width * 9 / 16)
+            if im.height > nh:
+                top = (im.height - nh) // 2
+                im = im.crop((0, top, im.width, top + nh))
+        if min_w and im.width < min_w:
+            im = im.resize((min_w, int(im.height * min_w / im.width)), Image.LANCZOS)
         if im.width > max_w:
             im = im.resize((max_w, int(im.height * max_w / im.width)))
         out = io.BytesIO()
@@ -617,6 +629,73 @@ def host_image(jpeg):
     return raw_url
 
 
+def cloudflare_image_bytes(prompt):
+    """Cloudflare Workers AI (FLUX schnell, free 10,000 neurons/din). Error par band, baaki run me Pixabay."""
+    global CF_OK, CF_ERR
+    if not CF_OK:
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/run/{CF_MODEL}"
+    text = prompt + ", photorealistic photograph, natural light, sharp focus, centered composition, no text, no watermark, no logo"
+    try:
+        r = requests.post(url, headers={"Authorization": "Bearer " + CF_TOKEN}, timeout=150,
+                          json={"prompt": text[:1900], "steps": 6})
+    except Exception as e:
+        print("Cloudflare image exception:", repr(e)[:120], flush=True)
+        return None
+    if r.status_code == 200:
+        ct = r.headers.get("content-type", "")
+        if ct.startswith("image"):
+            return r.content
+        try:
+            b64 = (r.json().get("result") or {}).get("image")
+            if b64:
+                return base64.b64decode(b64)
+        except Exception:
+            pass
+        print("Cloudflare image: jawab me image nahi mili.", r.text[:150], flush=True)
+        return None
+    print("Cloudflare image FAIL", r.status_code, r.text[:200], flush=True)
+    CF_ERR = f"{r.status_code} {r.text[:120]}"
+    if r.status_code in (401, 403, 404, 429) or "allocation" in r.text.lower() or "quota" in r.text.lower():
+        CF_OK = False
+        print("Cloudflare image band (key galat ya aaj ka free hissa khatam). Baaki run me Pixabay.", flush=True)
+    return None
+
+
+def ai_hosted_image(prompts, title, section=None):
+    """Cloudflare AI se image -> Gemini se match jaanch -> repo me host -> link."""
+    global CF_OK
+    if not CF_OK:
+        return None
+    want_extra = f"; it must clearly show: {section}" if section else ""
+    for prompt, tries in prompts:
+        if not prompt:
+            continue
+        for i in range(tries):
+            raw = cloudflare_image_bytes(prompt)
+            if not raw:
+                if not CF_OK:
+                    return None
+                continue
+            jpeg = to_jpeg(raw, ratio16x9=True, min_w=1200)
+            if not jpeg:
+                CF_OK = False
+                return None
+            res = judge(jpeg, "image/jpeg", title, prompt + want_extra)
+            if res is not None:
+                score, ok, problems = res
+                print(f"AI image try ({prompt[:40]}...) {i+1}: match={score} ok={ok} | {problems[:80]}", flush=True)
+                if not ok:
+                    continue
+            url = host_image(jpeg)
+            if not url:
+                CF_OK = False
+                return None
+            print("AI image hosted:", url, flush=True)
+            return url
+    return None
+
+
 def gemini_hosted_image(prompts, title):
     """Gemini se image -> Gemini se match jaanch -> repo me host -> link."""
     global GEMINI_IMG_OK
@@ -668,6 +747,10 @@ def make_image_html(prompt, alt, title, query=None, safe=None, section=None):
     if gurl:
         IMG_STATS["gemini"] += 1
         return img_block(gurl, alt, crop=False)
+    cf = ai_hosted_image([(prompt, 2), (safe, 1)], title, section)
+    if cf:
+        IMG_STATS["cloudflare"] += 1
+        return img_block(cf, alt, crop=False)
     pb = pixabay_image(query, title, section)
     if pb:
         IMG_STATS["pixabay"] += 1
@@ -939,7 +1022,8 @@ def main():
             time.sleep(PAUSE)
     print(f"\nIMAGES: {IMG_STATS} | Gemini image: {'chala' if GEMINI_IMG_OK else 'BAND'} | "
           f"last Gemini image error: {GEMINI_IMG_ERR or 'none'} | repo hosting: {'ok' if HOST_OK else 'FAIL'} | "
-          f"Pollinations: {'key nahi' if not POLL_KEY else ('chala' if POLL_OK else 'BAND (402/401)')}", flush=True)
+          f"Pollinations: {'key nahi' if not POLL_KEY else ('chala' if POLL_OK else 'BAND (402/401)')} | "
+          f"Cloudflare AI: {'key nahi' if not (CF_ACCOUNT and CF_TOKEN) else ('chala' if CF_OK else 'BAND')} {CF_ERR[:80]}", flush=True)
     print(f"\nSUMMARY: {good}/{TARGET_POSTS} {MODE} posts, {drafts} drafts", flush=True)
     if good == 0:
         sys.exit("Aaj ek bhi post nahi bani. Upar ke Attempt logs dekhein.")
