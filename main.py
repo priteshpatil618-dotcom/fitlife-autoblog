@@ -173,12 +173,12 @@ def youtube_lines():
     return out
 
 
-def youtube_videos(used):
-    """Pichhle 7 din ke sabse zyada dekhe gaye health/fitness videos (5 se 20 minute), jo embed ho sakte hain."""
+def _youtube_fetch(used, hours):
+    """Pichhle `hours` ghanton me upload hue health/fitness videos (5 se 20 minute), jo embed ho sakte hain."""
     if not YT_KEY:
         return []
     after = (datetime.datetime.now(datetime.timezone.utc) -
-             datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+             datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     ids = []
     for q in YT_QUERIES:
         try:
@@ -207,6 +207,9 @@ def youtube_videos(used):
                     continue
                 if it.get("status", {}).get("embeddable") is False:
                     continue
+                lang = (it["snippet"].get("defaultAudioLanguage") or "").lower()
+                if lang and not lang.startswith("hi"):   # saaf dikhe ki Hindi nahi hai to chhodo
+                    continue
                 out.append({"id": it["id"], "title": it["snippet"]["title"], "secs": secs,
                             "channel": it["snippet"].get("channelTitle", ""),
                             "views": int(it.get("statistics", {}).get("viewCount", 0))})
@@ -216,13 +219,27 @@ def youtube_videos(used):
     return out[:15]
 
 
+VIDEO_WINDOW_HOURS = int(os.environ.get("VIDEO_WINDOW_HOURS") or 48)
+
+
+def youtube_videos(used):
+    """Haal ke (48 ghante) naye videos: unke kul views ka matlab hai ki abhi khoob dekhe gaye.
+    3 se kam mile to 7 din tak badhate hain."""
+    vids = _youtube_fetch(used, VIDEO_WINDOW_HOURS)
+    print(f"YouTube: pichhle {VIDEO_WINDOW_HOURS} ghante me {len(vids)} video mile.", flush=True)
+    if len(vids) < 3:
+        vids = _youtube_fetch(used, 24 * 7)
+        print(f"YouTube: 7 din me {len(vids)} video mile.", flush=True)
+    return vids
+
+
 VIDEO_CLASS_PROMPT = """A popular YouTube video this week:
 Title: {title}
 Channel: {channel}
 
 Decide if it is a good base for a safe Hindi health/fitness article.
 NICHE = YES only if the topic is health, fitness, diet, yoga, sleep, skin/hair/body care or everyday wellness. NO for news, politics, entertainment, pest control, money, astrology, religion, animals.
-TYPE: HOWTO = practical how-to / home-care / lifestyle topic. AWARENESS = explaining a health condition for awareness only (symptoms, causes, prevention, when to see a doctor). AVOID = asks for a cure or treatment of a serious disease, medicines/injections/doses, pregnancy or baby/child treatment, extreme fasting, dangerous procedures.
+TYPE: HOWTO = practical how-to / home-care / lifestyle topic. AWARENESS = explaining a health condition for awareness only (symptoms, causes, prevention, when to see a doctor). AVOID = sexual or intimate-body topics (sexual health, intimate grooming, sperm or erection problems, sex), asks for a cure or treatment of a serious disease, medicines/injections/doses, pregnancy or baby/child treatment, extreme fasting, dangerous procedures.
 Reply EXACTLY in 3 lines:
 TOPIC: <topic in English + Hindi>
 TYPE: HOWTO or AWARENESS or AVOID
@@ -236,6 +253,7 @@ CLAIM2: <next one>
 (continue up to CLAIM6; only real points the video makes, at least 3 if it has them)
 RISK: SAFE or RISKY
 RISK_REASON: <one short English sentence>
+LANG: HINDI or OTHER (the main spoken language of the video)
 RISKY only if the video tells viewers that something CURES or TREATS a named disease, tells them to stop or replace medicines, gives medicine/supplement doses, or is about pregnancy, breastfeeding, children, eating disorders or extreme fasting (water-only or more than 24 hours).
 Casual mentions of general benefits (digestion, weight, sugar levels, immunity) are SAFE."""
 
@@ -256,7 +274,8 @@ def watch_video(v):
     if len(claims) < 2:
         return None
     return {"summary": field(text, "SUMMARY"), "claims": claims,
-            "risky": "RISKY" in field(text, "RISK").upper(), "reason": field(text, "RISK_REASON")}
+            "risky": "RISKY" in field(text, "RISK").upper(), "reason": field(text, "RISK_REASON"),
+            "other_lang": "OTHER" in field(text, "LANG").upper()}
 
 
 def build_video_context(v, info):
@@ -281,6 +300,16 @@ def video_embed(v):
             f'target="_blank">{t}</a> &middot; चैनल: {ch}</small></p>')
 
 
+SENSITIVE_WORDS = ["स्खलन", "शीघ्रपतन", "अंतरंग", "स्पर्म", "शुक्राणु", "यौन", "सेक्स", "नपुंसक", "लिंग", "योनि", "कामेच्छा",
+                   "वीर्य", "sperm", "sexual", "sex ", "intimate", "erectile", "ejaculation", "penis", "vagina",
+                   "genital", "libido"]
+
+
+def is_sensitive(text):
+    t = (text or "").lower()
+    return any(w.lower() in t for w in SENSITIVE_WORDS)
+
+
 PICK_PROMPT = """Below are today's Hindi health/lifestyle news headlines, trending searches in India and popular YouTube video titles:
 {list}
 
@@ -291,7 +320,7 @@ Skip topics already covered:
 TYPE rules:
 HOWTO = practical how-to / home-care / lifestyle topic (e.g. how to clean ears safely, ingrown hair care, dark inner thighs, a diet routine).
 AWARENESS = explaining a health condition for awareness only (symptoms, causes, risk factors, prevention, when to see a doctor), e.g. kidney disease symptoms.
-AVOID = asks for a cure or treatment of a serious disease, medicines/injections/doses, pregnancy or baby/child treatment, extreme fasting, dangerous procedures, deaths/sensitive celebrity or political news, anything unsafe to self-treat.
+AVOID = sexual or intimate-body topics (sexual health, intimate grooming, sperm or erection problems, sex), asks for a cure or treatment of a serious disease, medicines/injections/doses, pregnancy or baby/child treatment, extreme fasting, dangerous procedures, deaths/sensitive celebrity or political news, anything unsafe to self-treat.
 Prefer HOWTO or AWARENESS. Choose AVOID only if nothing else fits.
 
 Reply EXACTLY in 3 lines:
@@ -918,39 +947,72 @@ AUTHOR_BOX = ("<blockquote><b>लेखक:</b> " + htmllib.escape(AUTHOR_NAME) 
 BAD_TITLE_WORDS = ["100%", "चमत्कार", "जादुई", "तुरंत ठीक", "रामबाण", "कभी नहीं", "गारंटी", "हमेशा के लिए",
                    "डॉक्टर भी हैरान", "शॉकिंग", "वायरल"]
 
-TITLE_PROMPT = """Write click-worthy but HONEST Hindi titles for this health article (for Google Discover and Search).
+GENERIC_TITLE_WORDS = ["आसान", "असरदार", "कारगर", "जरूरी नियम", "सही तरीके", "सबसे", "बेहतरीन", "अचूक", "जबरदस्त"]
+
+TITLE_PROMPT = """Write specific, search-friendly but HONEST Hindi titles for this article (Google Search and Discover).
 Topic: {topic}
 Draft title: {title}
 Real headings in the article:
 {headings}
 Article opening: {opening}
+Titles of our recent posts (do NOT repeat their pattern or wording):
+{recent}
 
-Write 6 titles, each 38-56 characters, simple everyday Hindi (common English words are fine), each with a DIFFERENT formula:
-1 a question readers really ask
-2 a number list (only if the headings really contain that many tips/steps/mistakes)
-3 clear benefit + how
-4 mistakes to avoid
-5 myth vs fact
-6 what to do + when to see a doctor
-Rules: put the main keyword in the first half. Every promise must be something this article really delivers. NO exaggeration, fake urgency or miracle words (100%, चमत्कार, जादुई, तुरंत ठीक, रामबाण, कभी नहीं, गारंटी). No ALL CAPS, no emoji, at most one ? or : mark. Do not copy any video or news title.
-Then choose the single best one (curiosity + clarity + specificity + honesty).
+Write 6 titles of 38-58 characters in everyday Hindi (common English words are fine). Each title must:
+- name the exact problem or situation AND who it is for or when (age, skin type, season, routine, symptom), so the reader knows what this article solves
+- put the main keyword in the first half
+- use a different formula each: question people search / causes and prevention / benefits and risks / mistakes to avoid / myth vs fact / what to do and when to see a doctor
+- use a number only if the headings really contain that many items, and never start with a number
+- avoid these overused or hype words completely: आसान, असरदार, कारगर, जरूरी नियम, सही तरीके, सबसे, बेहतरीन, अचूक
+- avoid cure or guarantee wording (write 'कम करने में मदद', not 'दूर करें', 'घटाएं', 'खत्म'); no miracle words (100%, चमत्कार, जादुई, रामबाण, गारंटी, कभी नहीं)
+- no ALL CAPS, no emoji, at most one ? or : mark, and do not copy any video or news title
+Then choose the single best one (clarity, specificity, curiosity, honesty).
 Reply EXACTLY in 1 line:
 BEST: <the chosen title>"""
 
 
-def best_title(topic, title, html):
+def title_penalty(t):
+    """0 = saaf title. Hype/jhootha shabd ho to bahut bada penalty, generic shabd ho to chhota."""
+    if not (18 <= len(t) <= 62) or t.isupper():
+        return 100
+    bad = sum(w in t for w in BAD_TITLE_WORDS)
+    generic = sum(w in t for w in GENERIC_TITLE_WORDS)
+    return bad * 50 + generic * 5 + (3 if t[0].isdigit() else 0)
+
+
+def recent_titles(limit=12):
+    try:
+        r = requests.get(f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts", timeout=30,
+                         headers={"Authorization": "Bearer " + access_token()},
+                         params={"maxResults": limit, "fetchBodies": "false", "status": "live",
+                                 "fields": "items(title)"})
+        return [it["title"] for it in r.json().get("items", [])] if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+def best_title(topic, title, html, recent=None):
     headings = re.findall(r"<h[23][^>]*>(.*?)</h[23]>", html, flags=re.S)
     heads = "\n".join("- " + re.sub(r"<[^>]+>", "", h).strip() for h in headings[:14])
     opening = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))[:500]
-    txt, _ = gemini(TITLE_PROMPT.replace("{topic}", topic).replace("{title}", title)
-                    .replace("{headings}", heads).replace("{opening}", opening), fatal=False)
-    new = field(txt, "BEST").strip(" \"'*")
-    ok = 18 <= len(new) <= 62 and not any(w in new for w in BAD_TITLE_WORDS) and not new.isupper()
-    if ok:
-        print(f"Title: {title} -> {new}", flush=True)
-        return new
-    print("Title: naya title theek nahi laga, purana rakha:", title, flush=True)
-    return title
+    recent_txt = "\n".join("- " + x for x in (recent or [])[:12]) or "(none)"
+    prompt = (TITLE_PROMPT.replace("{topic}", topic).replace("{title}", title).replace("{headings}", heads)
+              .replace("{opening}", opening).replace("{recent}", recent_txt))
+    best, best_pen = title, title_penalty(title)
+    for attempt in range(2):
+        extra = "" if attempt == 0 else "\nYour previous answer still used a banned or overused word, or was too long or short. Fix that."
+        txt, _ = gemini(prompt + extra, fatal=False)
+        new = field(txt, "BEST").strip(" \"'*")
+        pen = title_penalty(new) if new else 100
+        if pen < best_pen:
+            best, best_pen = new, pen
+        if best_pen == 0:
+            break
+    if best != title:
+        print(f"Title: {title} -> {best} (penalty {best_pen})", flush=True)
+    else:
+        print("Title: purana rakha:", title, f"(penalty {best_pen})", flush=True)
+    return best
 
 
 def related_links(labels, own_title, limit=3):
@@ -1044,6 +1106,9 @@ def make_post(done, videos, items, save_draft=True):
     for v in [x for x in videos if x["id"] not in used][:8]:   # sabse zyada views wala pehle
         done.append("yt:" + v["id"])
         save_history(done)
+        if is_sensitive(v["title"]):
+            print("Video chhoda (sensitive topic):", v["title"][:60].encode("ascii", "replace").decode(), flush=True)
+            continue
         info = classify_video(v)
         if info and info["niche"] and info["type"] != "AVOID":
             pick = {"topic": info["topic"], "type": info["type"], "source": v["title"]}
@@ -1056,7 +1121,7 @@ def make_post(done, videos, items, save_draft=True):
     print("Topic:", topic, "| type:", typ, "| source:", pick["source"],
           "| video:", video["id"] if video else None, flush=True)
 
-    if typ == "AVOID":
+    if typ == "AVOID" or is_sensitive(topic + " " + pick["source"]):
         print("Topic risky/sensitive, article nahi likha.", flush=True)
         done.append(topic)
         save_history(done)
@@ -1069,7 +1134,13 @@ def make_post(done, videos, items, save_draft=True):
             vctx = (f'This article is based on the topic of a popular Hindi YouTube video titled "{video["title"]}". '
                     "You have not seen it; write a complete original guide on the topic.\n")
         else:
-            print("Video risk:", "RISKY" if winfo["risky"] else "SAFE", "|", winfo["reason"], flush=True)
+            print("Video risk:", "RISKY" if winfo["risky"] else "SAFE", "|", winfo["reason"],
+                  "| Hindi nahi:", winfo["other_lang"], flush=True)
+            if winfo["other_lang"]:
+                print("Video Hindi me nahi hai, chhoda.", flush=True)
+                done.append(topic)
+                save_history(done)
+                return "rejected"
             if winfo["risky"]:
                 print("Video risky nikla, article nahi likha.", flush=True)
                 done.append(topic)
@@ -1099,7 +1170,7 @@ def make_post(done, videos, items, save_draft=True):
         if after > before * 1.15 and "<h2" in et and "<table" in et:
             art["html"] = et
 
-    art["title"] = best_title(topic, art["title"], art["html"])
+    art["title"] = best_title(topic, art["title"], art["html"], recent_titles())
 
     check_text, _ = gemini(CHECK_PROMPT + art["html"][:40000])
     verdict = field(check_text, "VERDICT").upper()
